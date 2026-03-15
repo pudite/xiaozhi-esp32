@@ -419,7 +419,9 @@ void OledDisplay::SetAnimatedEmotionMode(bool enable) {
             ESP_LOGI(TAG, "Resuming LVGL port after direct panel updates");
             lvgl_port_resume();
         }
-        // 禁用动画表情模式 — RoboEyes对象会在其析构函数中自动清理
+        // 禁用动画表情模式 — 重置 RoboEyes 对象以确保完全清理
+        roboeyes_adapter_.reset();
+        // 显示情感标签
         if (emotion_label_ != nullptr) {
             lv_obj_remove_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
         }
