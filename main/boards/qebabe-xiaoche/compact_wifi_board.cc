@@ -7,7 +7,6 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
-#include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include <wifi_manager.h>
@@ -15,6 +14,7 @@
 // Forward declaration for Application function
 extern "C" void HandleMotorActionForApplication(int direction, int speed, int duration_ms, int priority);
 extern "C" void HandleMotorActionForEmotion(const char* emotion);
+extern "C" void HandleMotorActionForDance(uint8_t speed_percent);
 
 
 
@@ -39,9 +39,6 @@ private:
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
     Button boot_button_;
-    Button touch_button_;
-    Button volume_up_button_;
-    Button volume_down_button_;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -122,47 +119,11 @@ private:
             }
             app.ToggleChatState();
         });
-        touch_button_.OnPressDown([]() {
-            Application::GetInstance().StartListening();
-        });
-        touch_button_.OnPressUp([]() {
-            Application::GetInstance().StopListening();
-        });
-
-        volume_up_button_.OnClick([this]() {
-            auto codec = GetAudioCodec();
-            auto volume = codec->output_volume() + 10;
-            if (volume > 100) {
-                volume = 100;
-            }
-            codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-
-        volume_up_button_.OnLongPress([this]() {
-            GetAudioCodec()->SetOutputVolume(100);
-            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
-        });
-
-        volume_down_button_.OnClick([this]() {
-            auto codec = GetAudioCodec();
-            auto volume = codec->output_volume() - 10;
-            if (volume < 0) {
-                volume = 0;
-            }
-            codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-
-        volume_down_button_.OnLongPress([this]() {
-            GetAudioCodec()->SetOutputVolume(0);
-            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
-        });
+        // 触摸按钮和音量按钮已取消，不再初始化
     }
 
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
-        static LampController lamp(LAMP_GPIO);
         // No longer using MotorController - all motor control goes through Application
 
         // Add motor control tools to MCP server
@@ -180,10 +141,13 @@ private:
                 Property("duration_ms", kPropertyTypeInteger, 5000, 100, 10000)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
-                int duration = properties["duration_ms"].value<int>();
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
+                int duration = config.forward_duration_ms;
                 MotorMoveForward(duration, speed);
-                return std::string("Moved forward at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms";
+                return std::string("Moved forward at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms (using web config)";
             });
 
         mcp_server.AddTool("self.motor.move_backward",
@@ -198,10 +162,13 @@ private:
                 Property("duration_ms", kPropertyTypeInteger, 5000, 100, 10000)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
-                int duration = properties["duration_ms"].value<int>();
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
+                int duration = config.backward_duration_ms;
                 MotorMoveBackward(duration, speed);
-                return std::string("Moved backward at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms";
+                return std::string("Moved backward at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms (using web config)";
             });
 
         mcp_server.AddTool("self.motor.spin_around",
@@ -214,9 +181,13 @@ private:
                 Property("speed_percent", kPropertyTypeInteger, 100, 0, 100)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
-                MotorSpinAround(speed);
-                return std::string("Spin around completed at ") + std::to_string(speed) + "% speed";
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
+                int duration = config.spin_duration_ms;
+                HandleMotorActionForApplication(3, speed, duration, 2); // 方向3=左转，用于转圈
+                return std::string("Spin around completed at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms (using web config)";
             });
 
         mcp_server.AddTool("self.motor.turn_left",
@@ -231,10 +202,13 @@ private:
                 Property("duration_ms", kPropertyTypeInteger, 600, 100, 5000)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
-                int duration = properties["duration_ms"].value<int>();
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
+                int duration = config.left_turn_duration_ms;
                 MotorTurnLeftDuration(duration, speed);
-                return std::string("Turned left at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms";
+                return std::string("Turned left at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms (using web config)";
             });
 
         mcp_server.AddTool("self.motor.turn_right",
@@ -249,10 +223,13 @@ private:
                 Property("duration_ms", kPropertyTypeInteger, 600, 100, 5000)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
-                int duration = properties["duration_ms"].value<int>();
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
+                int duration = config.right_turn_duration_ms;
                 MotorTurnRightDuration(duration, speed);
-                return std::string("Turned right at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms";
+                return std::string("Turned right at ") + std::to_string(speed) + "% speed for " + std::to_string(duration) + "ms (using web config)";
             });
 
         mcp_server.AddTool("self.motor.quick_forward",
@@ -310,9 +287,12 @@ private:
                 Property("speed_percent", kPropertyTypeInteger, 100, 0, 100)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int speed = properties["speed_percent"].value<int>();
+                // 使用Application配置值，确保与WEB端行为一致
+                auto& app = Application::GetInstance();
+                const auto& config = app.GetMotorActionConfig();
+                int speed = config.default_speed_percent;
                 MotorDance(speed);
-                return std::string("Dance movement completed at ") + std::to_string(speed) + "% speed";
+                return std::string("Dance movement completed at ") + std::to_string(speed) + "% speed (using web config)";
             });
 
         mcp_server.AddTool("self.motor.stop",
@@ -430,6 +410,7 @@ private:
         return &led;
     }
 
+public:
     // Unified motor control through Application (single PWM system)
     void MotorMoveForward(int duration_ms = 5000, uint8_t speed_percent = 100) {
         HandleMotorActionForApplication(4, speed_percent, duration_ms, 2); // 4 = forward, high priority
@@ -461,7 +442,10 @@ private:
     }
 
     void MotorSpinAround(uint8_t speed_percent = 100) {
-        HandleMotorActionForApplication(3, speed_percent, 2000, 2); // Spin = turn left longer, high priority
+        // 使用Application配置的转圈时间，确保与WEB端行为一致
+        auto& app = Application::GetInstance();
+        const auto& config = app.GetMotorActionConfig();
+        HandleMotorActionForApplication(3, speed_percent, config.spin_duration_ms, 2); // Spin = turn left longer, high priority
     }
 
     void MotorQuickForward(uint8_t speed_percent = 100) {
@@ -519,10 +503,7 @@ public:
 
 public:
     CompactWifiBoard() :
-        boot_button_(BOOT_BUTTON_GPIO),
-        touch_button_(TOUCH_BUTTON_GPIO),
-        volume_up_button_(VOLUME_UP_BUTTON_GPIO),
-        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        boot_button_(BOOT_BUTTON_GPIO) {
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
@@ -657,6 +638,8 @@ extern "C" void HandleMotorActionForEmotion(const char* emotion) {
     auto board = static_cast<CompactWifiBoard*>(&Board::GetInstance());
     if (emotion) {
         std::string emotion_str(emotion);
+
+        // 情感动作映射（用于web端表情）
         if (emotion_str == "happy" || emotion_str == "joy") {
             board->OnHappy();
         } else if (emotion_str == "excited") {
@@ -679,6 +662,38 @@ extern "C" void HandleMotorActionForEmotion(const char* emotion) {
             board->OnAngry();
         } else if (emotion_str == "surprised") {
             board->OnSurprised();
+
+        // 语音控制指令映射（与web端按钮相同的行为，使用当前配置参数）
+        } else if (emotion_str == "forward" || emotion_str == "前进" || emotion_str == "move_forward") {
+            // 语音控制前进：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForApplication(4, config.default_speed_percent, config.forward_duration_ms, 1);
+        } else if (emotion_str == "backward" || emotion_str == "后退" || emotion_str == "move_backward") {
+            // 语音控制后退：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForApplication(2, config.default_speed_percent, config.backward_duration_ms, 1);
+        } else if (emotion_str == "left" || emotion_str == "turn_left" || emotion_str == "左转" || emotion_str == "向左转") {
+            // 语音控制左转：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForApplication(3, config.default_speed_percent, config.left_turn_duration_ms, 1);
+        } else if (emotion_str == "right" || emotion_str == "turn_right" || emotion_str == "右转" || emotion_str == "向右转") {
+            // 语音控制右转：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForApplication(1, config.default_speed_percent, config.right_turn_duration_ms, 1);
+        } else if (emotion_str == "spin_around" || emotion_str == "转圈" || emotion_str == "原地转圈") {
+            // 语音控制转圈：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForApplication(3, config.default_speed_percent, config.spin_duration_ms, 1); // 使用配置的转圈时间
+        } else if (emotion_str == "dance" || emotion_str == "跳舞" || emotion_str == "跳个舞") {
+            // 语音控制跳舞：使用与web端相同的参数（从Application配置获取）
+            auto& app = Application::GetInstance();
+            const auto& config = app.GetMotorActionConfig();
+            HandleMotorActionForDance(config.default_speed_percent);
         } else {
             ESP_LOGW(TAG, "Unknown emotion: %s", emotion_str.c_str());
         }

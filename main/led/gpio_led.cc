@@ -61,8 +61,6 @@ GpioLed::GpioLed(gpio_num_t gpio, int output_invert, ledc_timer_t timer_num, led
     // Set LED Controller with previously prepared configuration
     ledc_channel_config(&ledc_channel_);
 
-    // Initialize fade service.
-    ledc_fade_func_install(0);
 
     // When the callback registered by ledc_cb_degister is called, run led ->OnFadeEnd()
     ledc_cbs_t ledc_callbacks = {
@@ -92,7 +90,6 @@ GpioLed::~GpioLed() {
     esp_timer_stop(blink_timer_);
     if (ledc_initialized_) {
         ledc_fade_stop(ledc_channel_.speed_mode, ledc_channel_.channel);
-        ledc_fade_func_uninstall();
     }
 }
 

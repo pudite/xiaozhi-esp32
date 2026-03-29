@@ -204,6 +204,14 @@ private:
     void StopRealtimeMotorControl();
     // Timestamp (ms) of last realtime command, used for watchdog to auto-stop
     std::atomic<int64_t> last_realtime_command_ms_{0};
+
+    // WEB control state tracking for intelligent power management
+    std::atomic<bool> web_control_active_{false};
+    std::atomic<int64_t> last_web_control_time_ms_{0};
+    PowerSaveLevel current_power_level_{PowerSaveLevel::LOW_POWER};
+    static constexpr int WEB_CONTROL_TIMEOUT_MS = 30000;
+    std::mutex power_mutex_;  // 保护电源状态更新
+
     // PWM (LEDC) support
     bool motor_pwm_initialized_member_ = false;
     int pwm_freq_hz_ = 20000;
@@ -211,6 +219,9 @@ private:
     void InitMotorPwm();
     // Ramp (ms) for PWM fade
     int pwm_ramp_ms_ = 50;
+
+    // Intelligent power management
+    void UpdatePowerSaveLevel();
 
 
     // Event handlers

@@ -20,12 +20,10 @@
 #  endif
 #endif
 
-// Provide guarded defaults if the board did not define MOTOR_* pins
-#ifndef MOTOR_LF_GPIO
-#define MOTOR_LF_GPIO GPIO_NUM_12   // Left Forward
-#define MOTOR_LB_GPIO GPIO_NUM_13  // Left Backward
-#define MOTOR_RF_GPIO GPIO_NUM_14  // Right Forward
-#define MOTOR_RB_GPIO GPIO_NUM_21  // Right Backward (was GPIO_NUM_3)
+// Motor pins must be defined in board config.h - compilation will fail if missing
+#if !defined(MOTOR_LF_GPIO) || !defined(MOTOR_LB_GPIO) || \
+    !defined(MOTOR_RF_GPIO) || !defined(MOTOR_RB_GPIO)
+#error "Motor pins not defined. Please ensure board config.h is included and defines MOTOR_*_GPIO macros."
 #endif
 
 #define TAG "main"

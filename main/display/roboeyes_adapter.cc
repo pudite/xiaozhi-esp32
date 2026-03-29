@@ -165,6 +165,7 @@ void RoboEyesAdapter::RoboEyesTimerCallback(lv_timer_t* timer) {
 RoboEyesAdapter::RoboEyesAdapter() {}
 
 RoboEyesAdapter::~RoboEyesAdapter() {
+    StopTimer(); // Stop all timers before cleaning up resources
     if (canvas_ != nullptr) {
         lv_obj_del(canvas_);
         canvas_ = nullptr;
@@ -181,12 +182,7 @@ RoboEyesAdapter::~RoboEyesAdapter() {
         delete[] indexed_buffer_;
         indexed_buffer_ = nullptr;
     }
-    // stop any panel timer
-    if (panel_timer_ != nullptr) {
-        esp_timer_stop(panel_timer_);
-        esp_timer_delete(panel_timer_);
-        panel_timer_ = nullptr;
-    }
+    // panel timer already stopped by StopTimer() above
     // delete RoboEyes instance and shim if created
     if (eyes_obj_) {
         // eyes_obj_ is a RoboEyes<AdafruitShim>*
@@ -472,7 +468,15 @@ void RoboEyesAdapter::SetEmotion(const char* emotion) {
 
 
 void RoboEyesAdapter::DrawFrame() {
-    if (!initialized_ || bit_buffer_ == nullptr || canvas_buffer_ == nullptr) return;
+    // 增强检查：不仅检查initialized_，还要检查关键资源
+    if (!initialized_ || bit_buffer_ == nullptr || canvas_buffer_ == nullptr) {
+        // 如果是面板任务模式，可能正在停止中，静默返回
+        if (panel_task_ != nullptr) {
+            return;
+        }
+        ESP_LOGW(TAG, "DrawFrame skipped: resources not ready");
+        return;
+    }
 
     // Reset drawing flag for this frame
     drew_this_frame_ = false;
@@ -690,6 +694,8 @@ bool RoboEyesAdapter::StartTimer(int fps) {
                     self->Update();
                     vTaskDelay(pdMS_TO_TICKS(delay_ms));
                 }
+                // 安全退出：先清空运行标志，再通知主线程
+                self->panel_task_ = nullptr;
                 vTaskDelete(nullptr);
             },
             "roboeyes_panel_task",
@@ -738,9 +744,21 @@ void RoboEyesAdapter::StopTimer() {
     }
     if (panel_task_ != nullptr) {
         panel_task_running_ = false;
-        // wait a short moment for task to exit
-        vTaskDelay(pdMS_TO_TICKS(20));
-        panel_task_ = nullptr;
+        // 内存屏障确保标志同步
+        __sync_synchronize();
+
+        // 等待任务退出，带超时保护
+        int timeout_ms = 100;  // 100ms超时
+        while (panel_task_ != nullptr && timeout_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            timeout_ms -= 10;
+        }
+
+        if (panel_task_ != nullptr) {
+            ESP_LOGW(TAG, "Panel task did not exit cleanly within timeout");
+            // 强制处理：任务可能卡死，至少记录警告
+            panel_task_ = nullptr;
+        }
         ESP_LOGI(TAG, "Stopped panel task");
     }
 }

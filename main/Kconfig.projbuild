@@ -119,7 +119,7 @@ endchoice
 
 choice BOARD_TYPE
     prompt "Board Type"
-    default BOARD_TYPE_BREAD_COMPACT_WIFI
+    default BOARD_TYPE_QEBABE_XIAOCHE
     help
         Board type. 开发板类型
     config BOARD_TYPE_BREAD_COMPACT_WIFI
@@ -502,7 +502,7 @@ endchoice
 choice DISPLAY_OLED_TYPE
     depends on BOARD_TYPE_BREAD_COMPACT_WIFI || BOARD_TYPE_BREAD_COMPACT_ML307 || BOARD_TYPE_BREAD_COMPACT_ESP32 || BOARD_TYPE_HU_087 || BOARD_TYPE_QEBABE_XIAOCHE
     prompt "OLED Type"
-    default OLED_SSD1306_128X32
+    default OLED_SSD1306_128X64
     help
         OLED Monochrome Display Type
     config OLED_SSD1306_128X32

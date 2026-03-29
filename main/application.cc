@@ -31,12 +31,10 @@
 /* __has_include not available; rely on build system to provide config.h */
 #endif
 
-// 如果没有提供 BOARD 层的 MOTOR_* 定义，提供默认值以便本文件在不同环境下也能编译
-#ifndef MOTOR_LF_GPIO
-#define MOTOR_LF_GPIO GPIO_NUM_12
-#define MOTOR_LB_GPIO GPIO_NUM_13
-#define MOTOR_RF_GPIO GPIO_NUM_14
-#define MOTOR_RB_GPIO GPIO_NUM_21
+// 电机引脚必须在板级 config.h 中定义 - 如果缺失将导致编译失败
+#if !defined(MOTOR_LF_GPIO) || !defined(MOTOR_LB_GPIO) || \
+    !defined(MOTOR_RF_GPIO) || !defined(MOTOR_RB_GPIO)
+#error "Motor pins not defined. Please ensure board config.h is included and defines MOTOR_*_GPIO macros."
 #endif
 
 // Test comment to trigger reanalysis
@@ -355,6 +353,17 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+
+            // 检查WEB控制超时（每秒一次）
+            if (web_control_active_.load()) {
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                if ((now_ms - last_web_control_time_ms_.load()) > WEB_CONTROL_TIMEOUT_MS) {
+                    web_control_active_.store(false);
+                    UpdatePowerSaveLevel();
+                    ESP_LOGI(TAG, "WEB control timeout, switching to low power mode");
+                }
+            }
+
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -433,6 +442,7 @@ void Application::HandleActivationDoneEvent() {
     ota_.reset();
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    current_power_level_ = PowerSaveLevel::LOW_POWER;
 
     // Start web server for remote control
     web_server_->SetMotorControlCallback([this](int direction, int speed) {
@@ -540,6 +550,7 @@ void Application::CheckAssetsVersion() {
         vTaskDelay(pdMS_TO_TICKS(3000));
         SetDeviceState(kDeviceStateUpgrading);
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        current_power_level_ = PowerSaveLevel::PERFORMANCE;
         display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
 
         bool success = assets.Download(download_url, [display](int progress, size_t speed) -> void {
@@ -551,6 +562,7 @@ void Application::CheckAssetsVersion() {
         });
 
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        current_power_level_ = PowerSaveLevel::LOW_POWER;
         vTaskDelay(pdMS_TO_TICKS(1000));
 
         if (!success) {
@@ -676,7 +688,7 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        UpdatePowerSaveLevel();  // 统一电源决策
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
@@ -684,7 +696,7 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        UpdatePowerSaveLevel();  // 统一电源决策
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -1315,6 +1327,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
 
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    current_power_level_ = PowerSaveLevel::PERFORMANCE;
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -1331,6 +1344,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
         ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
         audio_service_.Start(); // Restart audio service
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); // Restore power save level
+        current_power_level_ = PowerSaveLevel::LOW_POWER;
         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));
         return false;
@@ -1558,6 +1572,14 @@ void Application::ExecuteMotorActionQueue() {
         }
 
         if (has_action) {
+            // Check if there's a higher priority motor action in progress
+            if (realtime_control_active_.load() && current_motor_priority_.load() > 0) {
+                ESP_LOGW(TAG, "Skipping queued motor action '%s': higher priority action in progress (priority=%d)",
+                         action.description.c_str(), current_motor_priority_.load());
+                // Skip this action and continue to next
+                continue;
+            }
+
             ESP_LOGI(TAG, "Executing queued motor action: %s", action.description.c_str());
 
             // Execute the action synchronously
@@ -1626,6 +1648,11 @@ void Application::HandleMotorActionWithDuration(int direction, int speed, int du
 
 void Application::HandleWebMotorControl(int direction, int speed) {
     ESP_LOGI(TAG, "Web motor control: direction=%d, speed=%d", direction, speed);
+
+    // 标记WEB控制活跃并更新时间戳
+    web_control_active_.store(true);
+    last_web_control_time_ms_.store(esp_timer_get_time() / 1000);
+    UpdatePowerSaveLevel();
 
     // 将网页控制转换为电机命令
     // direction: 0=停止, 1=右, 2=下(后退), 3=左, 4=上(前进)
@@ -1704,30 +1731,31 @@ void Application::SetRealtimeMotorCommand(int direction, int speed) {
         ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
 
         // 然后根据方向，把对应的通道设为目标占空比（平滑）
+        // 修正映射：根据测试结果，原映射逆时针旋转了90度，需要逆时针旋转90度修正
         switch (direction) {
-            case 1: // 右: LF (ch0) + RB (ch3)
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
-                break;
-            case 2: // 后退: LB (ch1) + RB (ch3)
+            case 1: // 右转: LB (ch1) + RB (ch3) [原后退]
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
                 break;
-            case 3: // 左: LB (ch1) + RF (ch2)
+            case 2: // 后退: LB (ch1) + RF (ch2) [原左转]
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
                 break;
-            case 4: // 前进: LF (ch0) + RF (ch2)
+            case 3: // 左转: LF (ch0) + RF (ch2) [原前进]
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
                 ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty, pwm_ramp_ms_);
                 ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
+                break;
+            case 4: // 前进: LF (ch0) + RB (ch3) [原右转]
+                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty, pwm_ramp_ms_);
+                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
+                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty, pwm_ramp_ms_);
+                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
                 break;
             default:
                 break;
@@ -1741,21 +1769,21 @@ void Application::SetRealtimeMotorCommand(int direction, int speed) {
             gpio_set_level(MOTOR_RB_GPIO, 0);
 
             switch (direction) {
-                case 1:
-                    gpio_set_level(MOTOR_LF_GPIO, 1);
-                    gpio_set_level(MOTOR_RB_GPIO, 1);
-                    break;
-                case 2:
+                case 1: // 右转: LB + RB [原后退]
                     gpio_set_level(MOTOR_LB_GPIO, 1);
                     gpio_set_level(MOTOR_RB_GPIO, 1);
                     break;
-                case 3:
+                case 2: // 后退: LB + RF [原左转]
                     gpio_set_level(MOTOR_LB_GPIO, 1);
                     gpio_set_level(MOTOR_RF_GPIO, 1);
                     break;
-                case 4:
+                case 3: // 左转: LF + RF [原前进]
                     gpio_set_level(MOTOR_LF_GPIO, 1);
                     gpio_set_level(MOTOR_RF_GPIO, 1);
+                    break;
+                case 4: // 前进: LF + RB [原右转]
+                    gpio_set_level(MOTOR_LF_GPIO, 1);
+                    gpio_set_level(MOTOR_RB_GPIO, 1);
                     break;
                 default:
                     break;
@@ -1848,10 +1876,6 @@ void Application::InitMotorPwm() {
     if (ledc_channel_config(&ch) != ESP_OK) {
         ESP_LOGE(TAG, "InitMotorPwm: ledc_channel_config ch3 failed");
     }
-    // Install fade service for smooth transitions
-    if (ledc_fade_func_install(0) != ESP_OK) {
-        ESP_LOGW(TAG, "InitMotorPwm: ledc_fade_func_install failed or already installed");
-    }
 
     motor_pwm_initialized_member_ = true;
     ESP_LOGI(TAG, "InitMotorPwm: initialized (freq=%dHz, bits=%d, ramp=%dms)", pwm_freq_hz_, pwm_resolution_bits_, pwm_ramp_ms_);
@@ -1913,6 +1937,41 @@ void Application::SaveMotorActionConfig() {
     ESP_LOGI(TAG, "  快速前进时间: %d ms", motor_action_config_.quick_forward_duration_ms);
     ESP_LOGI(TAG, "  快速后退时间: %d ms", motor_action_config_.quick_backward_duration_ms);
     ESP_LOGI(TAG, "  默认速度: %d%%", motor_action_config_.default_speed_percent);
+}
+
+void Application::UpdatePowerSaveLevel() {
+    std::lock_guard<std::mutex> lock(power_mutex_);
+
+    bool needs_performance = web_control_active_.load();
+
+    // 安全检查：protocol_可能为空
+    if (protocol_) {
+        needs_performance = needs_performance || protocol_->IsAudioChannelOpened();
+    }
+
+    PowerSaveLevel new_level = needs_performance ?
+        PowerSaveLevel::PERFORMANCE : PowerSaveLevel::LOW_POWER;
+
+    // 去重检查：避免重复设置相同状态
+    if (new_level != current_power_level_) {
+        Board::GetInstance().SetPowerSaveLevel(new_level);
+        current_power_level_ = new_level;
+
+        const char* trigger = "unknown";
+        if (new_level == PowerSaveLevel::PERFORMANCE) {
+            if (web_control_active_.load() && protocol_ && protocol_->IsAudioChannelOpened()) {
+                trigger = "web+audio";
+            } else if (web_control_active_.load()) {
+                trigger = "web";
+            } else if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                trigger = "audio";
+            }
+        }
+
+        ESP_LOGI(TAG, "Power save level changed to: %s (trigger: %s)",
+                 new_level == PowerSaveLevel::PERFORMANCE ? "PERFORMANCE" : "LOW_POWER",
+                 trigger);
+    }
 }
 
 void Application::SetMotorActionConfig(const MotorActionConfig& config) {
