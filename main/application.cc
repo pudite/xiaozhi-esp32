@@ -10,6 +10,7 @@
 #include "assets.h"
 #include "settings.h"
 #include "web_server/web_server.h"
+#include "esp32_camera.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -19,6 +20,7 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 #include <tuple>
+#include <utility>
 
 #define TAG "Application"
 // 包含板级引脚配置（由选定的 board 提供的 config.h）
@@ -454,6 +456,82 @@ void Application::HandleActivationDoneEvent() {
         auto display = Board::GetInstance().GetDisplay();
         display->SetEmotion(emotion);
     });
+
+    // Set camera callback for video streaming
+    web_server_->SetCameraCallback([]() -> Esp32Camera* {
+        auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+        return camera;
+    });
+
+    // Set camera snapshot callback for photo capture
+    web_server_->SetCameraSnapshotCallback([]() -> bool {
+        auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+        return camera && camera->CaptureStreamFrame();
+    });
+
+    // Set camera flip callbacks with NVS persistence
+    Settings camera_settings("camera", true);
+    bool init_h_mirror = camera_settings.GetBool("h_mirror", false);
+    bool init_v_flip = camera_settings.GetBool("v_flip", true);  // 默认上下翻转（摄像头倒装）
+    web_server_->SetCameraFlipCallback(
+        []() -> std::pair<bool, bool> {
+            auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+            if (camera) {
+                return {camera->IsHMirror(), camera->IsVFlip()};
+            }
+            return {false, false};
+        },
+        [](bool h_mirror, bool v_flip) {
+            auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+            if (camera) {
+                camera->SetHMirror(h_mirror);
+                camera->SetVFlip(v_flip);
+                Settings s("camera", true);
+                s.SetBool("h_mirror", h_mirror);
+                s.SetBool("v_flip", v_flip);
+                ESP_LOGI("Application", "Camera flip saved: h_mirror=%d, v_flip=%d", h_mirror, v_flip);
+            }
+        }
+    );
+    // 初始化时应用保存的翻转设置
+    if (init_h_mirror || init_v_flip) {
+        auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+        if (camera) {
+            if (init_h_mirror) camera->SetHMirror(true);
+            if (init_v_flip) camera->SetVFlip(true);
+            ESP_LOGI(TAG, "Applied saved camera flip: h_mirror=%d, v_flip=%d", init_h_mirror, init_v_flip);
+        }
+    }
+
+    // 摄像头 JPEG 质量回调（通过 /api/camera/quality 设置）
+    web_server_->SetCameraQualityCallback(
+        [](int quality) -> bool {
+            auto* camera = dynamic_cast<Esp32Camera*>(Board::GetInstance().GetCamera());
+            if (camera) {
+                bool ok = camera->SetJpegQuality(quality);
+                if (ok) {
+                    Settings s("camera", true);
+                    s.SetInt("jpeg_quality", quality);
+                    ESP_LOGI(TAG, "Camera JPEG quality set to: %d", quality);
+                }
+                return ok;
+            }
+            return false;
+        }
+    );
+
+    // 电源管理回调（视频流期间强制高性能模式）
+    web_server_->SetPowerSaveCallback(
+        [](bool performance) {
+            if (performance) {
+                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+                ESP_LOGI(TAG, "Power save: PERFORMANCE mode (streaming active)");
+            } else {
+                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+                ESP_LOGI(TAG, "Power save: LOW_POWER mode (streaming stopped)");
+            }
+        }
+    );
 
     // Set motor action config callbacks for web interface
     web_server_->SetMotorActionConfigCallback(

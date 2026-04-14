@@ -1,11 +1,16 @@
 #include "web_server.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <cstring>
 #include <cJSON.h>
 #include <esp_system.h>
+#include <lwip/sockets.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdlib.h>
+#include <fcntl.h>
+
+#include "esp32_camera.h"
 
 // Forward declarations for motor control functions
 extern "C" void HandleMotorActionForApplication(int direction, int speed, int duration_ms, int priority);
@@ -15,7 +20,7 @@ extern "C" void HandleMotorActionForDance(uint8_t speed_percent);
 static const char *TAG = "WebServer";
 
 WebServer::WebServer()
-    : server_handle_(nullptr) {
+    : server_handle_(nullptr), stream_server_handle_(nullptr), stream_port_(81) {
 }
 
 WebServer::~WebServer() {
@@ -27,11 +32,13 @@ bool WebServer::Start(int port) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
-    config.max_uri_handlers = 10;
-    // 增加超时设置以更好地处理频繁请求
-    config.recv_wait_timeout = 5;  // 接收超时5秒
-    config.send_wait_timeout = 5;  // 发送超时5秒
-    config.max_resp_headers = 8;   // 减少响应头数量
+    config.max_uri_handlers = 18;
+    config.max_open_sockets = 10;       // 增加并发连接（LWIP_MAX_SOCKETS=16，减去3个内部占用=13上限）
+    config.backlog_conn = 5;            // 增加连接等待队列
+    config.lru_purge_enable = true;     // 满时清除最不活跃连接
+    config.recv_wait_timeout = 3;       // 接收超时3秒
+    config.send_wait_timeout = 3;       // 发送超时3秒
+    config.max_resp_headers = 8;        // 减少响应头数量
 
     if (httpd_start(&server_handle_, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -70,6 +77,8 @@ bool WebServer::Start(int port) {
         .user_ctx  = this
     };
     httpd_register_uri_handler(server_handle_, &api_motor_action_uri);
+
+    // 注意：/stream 处理器已移至独立的流媒体服务器（端口 8080）
 
     httpd_uri_t debug_uri = {
         .uri       = "/api/debug/motor_test",
@@ -112,11 +121,98 @@ bool WebServer::Start(int port) {
     };
     httpd_register_uri_handler(server_handle_, &api_config_post_uri);
 
+    // 注册摄像头翻转 API
+    httpd_uri_t api_camera_flip_get_uri = {
+        .uri       = "/api/camera/flip",
+        .method    = HTTP_GET,
+        .handler   = api_camera_flip_get_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_camera_flip_get_uri);
+
+    httpd_uri_t api_camera_flip_post_uri = {
+        .uri       = "/api/camera/flip",
+        .method    = HTTP_POST,
+        .handler   = api_camera_flip_post_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_camera_flip_post_uri);
+
+    httpd_uri_t api_camera_photo_uri = {
+        .uri       = "/api/camera/photo",
+        .method    = HTTP_GET,
+        .handler   = api_camera_photo_get_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_camera_photo_uri);
+
+    httpd_uri_t api_camera_quality_uri = {
+        .uri       = "/api/camera/quality",
+        .method    = HTTP_POST,
+        .handler   = api_camera_quality_post_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_camera_quality_uri);
+
+    // 注册表情控制 API
+    httpd_uri_t api_emotion_uri = {
+        .uri       = "/api/emotion",
+        .method    = HTTP_POST,
+        .handler   = api_emotion_post_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_emotion_uri);
+
     ESP_LOGI(TAG, "Web server started successfully");
+
+    // 启动独立的流媒体服务器（避免阻塞控制 API）
+    if (!start_stream_server()) {
+        ESP_LOGW(TAG, "Stream server failed to start, continuing without it");
+    }
+
+    return true;
+}
+
+bool WebServer::start_stream_server() {
+    if (!camera_callback_) {
+        ESP_LOGI(TAG, "Camera not available, skipping stream server");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Starting stream server on port %d", stream_port_);
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = stream_port_;
+    config.ctrl_port = 0;  // 自动分配控制端口，避免与第一个httpd实例的ctrl_port冲突
+    config.max_uri_handlers = 2;
+    config.max_open_sockets = 5;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
+
+    if (httpd_start(&stream_server_handle_, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start stream server");
+        return false;
+    }
+
+    httpd_uri_t stream_uri = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_get_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(stream_server_handle_, &stream_uri);
+
+    ESP_LOGI(TAG, "Stream server started on port %d", stream_port_);
     return true;
 }
 
 void WebServer::Stop() {
+    if (stream_server_handle_) {
+        httpd_stop(stream_server_handle_);
+        stream_server_handle_ = nullptr;
+        ESP_LOGI(TAG, "Stream server stopped");
+    }
     if (server_handle_) {
         httpd_stop(server_handle_);
         server_handle_ = nullptr;
@@ -148,6 +244,201 @@ void WebServer::SetEmotion(const char* emotion) {
     if (emotion_callback_) {
         emotion_callback_(emotion);
     }
+}
+
+void WebServer::SetCameraCallback(std::function<Esp32Camera*()> callback) {
+    camera_callback_ = callback;
+}
+
+void WebServer::SetCameraFlipCallback(std::function<std::pair<bool, bool>()> get_callback,
+                                      std::function<void(bool, bool)> set_callback) {
+    get_camera_flip_callback_ = get_callback;
+    set_camera_flip_callback_ = set_callback;
+}
+
+void WebServer::SetCameraQualityCallback(std::function<bool(int)> callback) {
+    camera_quality_callback_ = callback;
+}
+
+void WebServer::SetPowerSaveCallback(std::function<void(bool performance)> callback) {
+    power_save_callback_ = callback;
+}
+
+void WebServer::SetCameraSnapshotCallback(std::function<bool()> callback) {
+    camera_snapshot_callback_ = callback;
+}
+
+esp_err_t WebServer::api_camera_photo_get_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (!server->camera_callback_) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera not available");
+        return ESP_FAIL;
+    }
+
+    Esp32Camera* camera = server->camera_callback_();
+    if (!camera || !camera->CaptureStreamFrame()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to capture frame");
+        return ESP_FAIL;
+    }
+
+    const uint8_t* jpeg_data = camera->GetFrameData();
+    size_t jpeg_size = camera->GetFrameSize();
+    if (!jpeg_data || jpeg_size == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Empty frame");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char len_str[16];
+    snprintf(len_str, sizeof(len_str), "%u", (unsigned)jpeg_size);
+    httpd_resp_set_hdr(req, "Content-Length", len_str);
+    httpd_resp_send(req, (const char*)jpeg_data, jpeg_size);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_camera_quality_post_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    char content[128];
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
+    }
+    content[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *quality_item = cJSON_GetObjectItem(root, "quality");
+    if (!quality_item || !cJSON_IsNumber(quality_item)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid quality field");
+        return ESP_FAIL;
+    }
+
+    int quality = quality_item->valueint;
+    bool success = false;
+    if (server->camera_quality_callback_) {
+        success = server->camera_quality_callback_(quality);
+    }
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    char json[64];
+    snprintf(json, sizeof(json), "{\"status\":\"%s\",\"quality\":%d}",
+             success ? "ok" : "failed", quality);
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_emotion_post_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    // 读取请求体
+    int total_len = req->content_len;
+    if (total_len <= 0 || total_len > 512) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        return ESP_FAIL;
+    }
+
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, total_len);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    // 解析 JSON: {"emotion":"neutral"}
+    cJSON *json = cJSON_Parse(buf);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *emotion_item = cJSON_GetObjectItem(json, "emotion");
+    if (!emotion_item || !cJSON_IsString(emotion_item)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing emotion field");
+        return ESP_FAIL;
+    }
+
+    server->SetEmotion(emotion_item->valuestring);
+    cJSON_Delete(json);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_camera_flip_get_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (!server->get_camera_flip_callback_) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"h_mirror\":false,\"v_flip\":false}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    auto flip = server->get_camera_flip_callback_();
+    char json[64];
+    snprintf(json, sizeof(json), "{\"h_mirror\":%s,\"v_flip\":%s}",
+             flip.first ? "true" : "false", flip.second ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_camera_flip_post_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    char content[128];
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
+    }
+    content[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *j_mirror = cJSON_GetObjectItem(root, "h_mirror");
+    cJSON *j_flip = cJSON_GetObjectItem(root, "v_flip");
+
+    bool h_mirror = cJSON_IsTrue(j_mirror);
+    bool v_flip = cJSON_IsTrue(j_flip);
+    cJSON_Delete(root);
+
+    if (server->set_camera_flip_callback_) {
+        server->set_camera_flip_callback_(h_mirror, v_flip);
+    }
+
+    char json[64];
+    snprintf(json, sizeof(json), "{\"h_mirror\":%s,\"v_flip\":%s}",
+             h_mirror ? "true" : "false", v_flip ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
 esp_err_t WebServer::index_get_handler(httpd_req_t *req) {
@@ -427,6 +718,157 @@ esp_err_t WebServer::api_motor_action_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// 同步采集发送：避免 pipeline 缓冲延迟
+esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    // 所有变量声明必须在最前面（避免 goto 跳过初始化）
+    int fd = -1;
+    ssize_t ret = 0;
+    size_t tx_buf_size = 64 * 1024;
+    uint8_t* tx_buf = nullptr;
+    int consecutive_failures = 0;
+    const int max_consecutive_failures = 10;
+    int frames_sent = 0;
+    int frames_dropped = 0;
+    struct timeval tv = {0, 50000};
+    const char* response_headers = nullptr;
+
+    ESP_LOGD(TAG, "Stream: handler entry, req=%p", (void*)req);
+
+    if (!server->camera_callback_) {
+        ESP_LOGW(TAG, "Stream: camera_callback_ is null");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera not available");
+        return ESP_FAIL;
+    }
+
+    fd = httpd_req_to_sockfd(req);
+    ESP_LOGI(TAG, "Stream client connected, fd=%d", fd);
+
+    // 流媒体开始时强制 WiFi 高性能模式，降低网络延迟
+    if (server->power_save_callback_) {
+        ESP_LOGI(TAG, "Stream: forcing WiFi PERFORMANCE mode");
+        server->power_save_callback_(true);
+    }
+
+    // 手动发送 HTTP 响应头
+    response_headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace;boundary=frame\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Expires: 0\r\n"
+        "\r\n";
+    ret = send(fd, response_headers, strlen(response_headers), 0);
+    ESP_LOGI(TAG, "Stream: headers sent, ret=%d (expected %d)", (int)ret, (int)strlen(response_headers));
+    if (ret < 0) {
+        ESP_LOGE(TAG, "Stream headers send failed, errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    // 设置发送超时 50ms（防止单次 send() 无限阻塞）
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    // 分配 TX 缓冲区
+    tx_buf = (uint8_t*)heap_caps_malloc(tx_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tx_buf) {
+        ESP_LOGE(TAG, "Stream: TX buffer alloc failed");
+        goto stream_end;
+    }
+
+    ESP_LOGD(TAG, "Stream: entering capture loop, fd=%d", fd);
+
+    while (true) {
+        Esp32Camera* camera = server->camera_callback_();
+        if (!camera) {
+            ESP_LOGW(TAG, "Stream: camera callback returned null (fail count: %d)", consecutive_failures + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            consecutive_failures++;
+            if (consecutive_failures > max_consecutive_failures) {
+                ESP_LOGE(TAG, "Camera not available, stopping stream");
+                break;
+            }
+            continue;
+        }
+
+        if (!camera->CaptureStreamFrame()) {
+            ESP_LOGW(TAG, "Stream: CaptureStreamFrame failed (fail count: %d)", consecutive_failures + 1);
+            consecutive_failures++;
+            if (consecutive_failures > max_consecutive_failures) {
+                ESP_LOGE(TAG, "Too many capture failures (%d), stopping stream", consecutive_failures);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        consecutive_failures = 0;
+
+        const uint8_t* jpeg_data = camera->GetFrameData();
+        size_t jpeg_size = camera->GetFrameSize();
+
+        if (!jpeg_data || jpeg_size == 0) {
+            ESP_LOGW(TAG, "Stream: frame has no data or size=0 after CaptureStreamFrame success");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // 构建完整帧：multipart header + JPEG data（原子发送，不拆分）
+        char hdr[128];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+            (unsigned)jpeg_size);
+        size_t total_len = hdr_len + jpeg_size;
+
+        if (total_len > tx_buf_size) {
+            ESP_LOGW(TAG, "Stream: frame too large (%u > %u), dropping", (unsigned)total_len, (unsigned)tx_buf_size);
+            frames_dropped++;
+            continue;
+        }
+
+        // 一次性拷贝到 TX 缓冲
+        memcpy(tx_buf, hdr, hdr_len);
+        memcpy(tx_buf + hdr_len, jpeg_data, jpeg_size);
+
+        // 发送完整帧（send 有 50ms 超时保护，不会无限阻塞）
+        size_t sent_total = 0;
+        while (sent_total < total_len) {
+            ssize_t sent = send(fd, tx_buf + sent_total, total_len - sent_total, 0);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // 发送缓冲区满，丢弃此帧（保证原子性，不发不完整数据）
+                    frames_dropped++;
+                    goto next_frame;
+                }
+                ESP_LOGW(TAG, "Stream: send failed fd=%d, errno=%d", fd, errno);
+                goto stream_end;
+            }
+            sent_total += sent;
+        }
+
+        frames_sent++;
+        if (frames_sent % 50 == 1) {
+            ESP_LOGI(TAG, "Stream: %d frames sent, %d dropped", frames_sent, frames_dropped);
+        }
+
+next_frame:;
+    }
+
+stream_end:
+    if (tx_buf) {
+        heap_caps_free(tx_buf);
+    }
+    // 流媒体结束，恢复电源管理模式
+    if (server->power_save_callback_) {
+        ESP_LOGI(TAG, "Stream: restoring WiFi power save mode");
+        server->power_save_callback_(false);
+    }
+
+    ESP_LOGI(TAG, "Stream handler exiting, fd=%d, total %d frames", fd, frames_sent);
+    return ESP_OK;
+}
+
 void WebServer::parse_simple_control_command(const char* data, int& direction, int& speed) {
     // 简单解析格式：direction=X,speed=Y
     char* str = strdup(data);
@@ -453,509 +895,445 @@ const char* WebServer::get_html_page() {
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>小智小车遥控器</title>
     <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: -apple-system, 'Segoe UI', sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin: 0;
-            padding: 20px;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+            padding: 6px;
         }
-
         .container {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            text-align: center;
+            background: rgba(255,255,255,0.95);
+            border-radius: 16px;
+            padding: 10px 14px 16px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
             max-width: 400px;
             width: 100%;
         }
+        .header { text-align: center; margin-bottom: 6px; }
+        .header h1 { color: #333; font-size: 1.15em; margin-bottom: 1px; }
+        .header .subtitle { color: #888; font-size: 0.7em; }
 
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 2.2em;
+        /* 视频控制栏 - 左边视频状态，右边遥控状态 */
+        .video-bar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 8px; background: #1a1a2e;
+            border-radius: 10px; margin-bottom: 0;
+        }
+        .video-bar .left {
+            display: flex; align-items: center; flex: 1; min-width: 0;
+        }
+        .video-bar .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #555; flex-shrink: 0; margin-right: 6px;
+        }
+        .video-bar .status-dot.on { background: #4CAF50; }
+        .video-bar .label { color: #aaa; font-size: 11px; }
+        .video-bar .label.active { color: #4CAF50; }
+        .video-bar .remote-badge {
+            background: #d4edda; color: #155724;
+            padding: 3px 10px; border-radius: 10px;
+            font-size: 10px; font-weight: 600; white-space: nowrap;
+            margin-left: 8px;
+        }
+        .bar-btn {
+            background: rgba(255,255,255,0.1);
+            color: #ccc; border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px; padding: 4px 10px; font-size: 12px;
+            cursor: pointer; white-space: nowrap; margin-left: 4px;
+        }
+        .bar-btn:active { background: rgba(255,255,255,0.2); }
+
+        /* 视频面板（开启时显示） */
+        .video-panel {
+            background: #1a1a2e; border-radius: 0 0 10px 10px;
+            overflow: hidden; margin-bottom: 6px;
+            display: none;
+        }
+        .video-panel.show { display: block; }
+        .video-panel img { width: 100%; display: block; }
+
+        /* 视频底部操作栏：设置 + 拍照 居中 */
+        .video-actions {
+            display: flex; align-items: center; justify-content: center;
+            padding: 6px 8px; gap: 8px; background: #16213e;
+        }
+        .video-actions .act-btn {
+            background: rgba(255,255,255,0.1);
+            color: #ccc; border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px; padding: 5px 14px; font-size: 12px;
+            cursor: pointer; transition: all 0.2s;
+        }
+        .video-actions .act-btn:active { background: rgba(255,255,255,0.2); }
+        .video-actions .act-btn.photo {
+            background: linear-gradient(135deg, #FF6B6B, #EE5A24);
+            color: white; border: none;
         }
 
-        .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1em;
+        /* 翻转选项（展开时显示） */
+        .flip-options {
+            display: none; padding: 6px 8px; gap: 8px;
+            background: #16213e; justify-content: center;
+        }
+        .flip-options.show { display: flex; }
+        .flip-options .flip-toggle {
+            background: rgba(255,255,255,0.08);
+            color: #888; border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px; padding: 5px 12px; font-size: 11px;
+            cursor: pointer; transition: all 0.2s;
+        }
+        .flip-options .flip-toggle.active {
+            background: rgba(76,175,80,0.25); color: #4CAF50; border-color: #4CAF50;
         }
 
+        /* 底部按钮栏 */
+        .bottom-bar {
+            display: flex; align-items: center; justify-content: center;
+            gap: 6px; margin: 6px 0;
+        }
+        .bottom-btn {
+            background: linear-gradient(135deg, #28a745, #20c997);
+            color: white; border: none; border-radius: 10px;
+            padding: 10px 6px; font-size: 13px; cursor: pointer;
+            font-weight: 600; text-align: center; text-decoration: none;
+            transition: transform 0.15s;
+        }
+        .bottom-btn:active { transform: scale(0.95); }
+        .bottom-btn.stop {
+            background: linear-gradient(135deg, #DC3545, #C82333);
+        }
+        .bottom-btn.config {
+            background: linear-gradient(135deg, #FF9800, #F57C00);
+        }
+        .bottom-btn.refresh {
+            background: linear-gradient(135deg, #2196F3, #1976D2);
+        }
+
+        /* 拍照成功提示（浮动，不覆盖状态栏） */
+        .toast {
+            position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(76,175,80,0.95); color: white;
+            padding: 8px 20px; border-radius: 20px; font-size: 13px;
+            z-index: 9999; opacity: 0; transition: opacity 0.3s;
+            pointer-events: none;
+        }
+        .toast.show { opacity: 1; }
+        .toast.error { background: rgba(220,53,69,0.95); }
+
+        /* 摇杆（居中显示） */
+        .joystick-section {
+            display: flex; flex-direction: column; align-items: center;
+            margin: 4px 0 8px;
+        }
+        .joystick-wrap { margin: 0 auto; max-width: 280px; width: 70%; }
         .joystick-container {
-            position: relative;
-            width: 400px;
-            height: 400px;
-            margin: 0 auto 30px;
-            border-radius: 50%;
-            background: #f0f0f0;
-            border: 3px solid #ddd;
-            touch-action: none;
+            position: relative; width: 100%; aspect-ratio: 1;
+            border-radius: 50%; background: #f0f0f0;
+            border: 3px solid #ddd; touch-action: none;
         }
-
         .joystick {
-            position: absolute;
-            width: 112px;
-            height: 112px;
+            position: absolute; width: 28%; height: 28%;
             background: linear-gradient(135deg, #4CAF50, #45a049);
-            border-radius: 50%;
-            top: 50%;
-            left: 50%;
+            border-radius: 50%; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-            transition: all 0.1s ease;
-            cursor: pointer;
+            transition: all 0.1s ease; cursor: pointer;
         }
-
         .joystick.active {
             background: linear-gradient(135deg, #2196F3, #1976D2);
             transform: translate(-50%, -50%) scale(0.95);
         }
-
         .direction-indicator {
-            position: absolute;
-            top: 50%;
-            left: 50%;
+            position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
-            font-size: 18px;
-            font-weight: bold;
-            color: #333;
-            pointer-events: none;
-            transition: opacity 0.3s ease;
+            font-size: 16px; font-weight: bold; color: #333;
+            pointer-events: none; transition: opacity 0.3s;
         }
+        .direction-indicator.active { opacity: 1; }
 
-        .direction-indicator.active {
-            opacity: 1;
+        /* 动作控制（可折叠，默认折叠） */
+        .actions-section { margin-top: 4px; }
+        .actions-header {
+            display: flex; align-items: center; justify-content: center;
+            padding: 8px; cursor: pointer; user-select: none;
+            background: #f8f9fa; border-radius: 10px; margin-bottom: 4px;
         }
-
-        .status {
-            margin-top: 20px;
-            padding: 10px;
-            border-radius: 10px;
-            background: #f8f9fa;
-            border: 1px solid #e9ecef;
+        .actions-header h3 {
+            font-size: 0.9em; color: #333; margin: 0;
         }
-
-        .status.connected {
-            background: #d4edda;
-            border-color: #c3e6cb;
-            color: #155724;
+        .actions-header .arrow {
+            margin-left: 8px; font-size: 12px; color: #666;
+            transition: transform 0.2s;
         }
-
-        .status.disconnected {
-            background: #f8d7da;
-            border-color: #f5c6cb;
-            color: #721c24;
+        .actions-header .arrow.open { transform: rotate(180deg); }
+        .actions-grid {
+            display: none; grid-template-columns: repeat(3, 1fr); gap: 6px;
         }
-
-        .controls {
-            margin-top: 20px;
-        }
-
-        .control-btn {
-            background: linear-gradient(135deg, #FF6B6B, #EE5A24);
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 25px;
-            font-size: 16px;
-            cursor: pointer;
-            margin: 5px;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);
-        }
-
-        .control-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(255, 107, 107, 0.4);
-        }
-
-        .control-btn:active {
-            transform: translateY(0);
-        }
-
-        .stop-btn {
-            background: linear-gradient(135deg, #DC3545, #C82333);
-        }
-
-        .stop-btn:hover {
-            box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
-        }
-
-        /* 动作控制区域样式 */
-        .actions-section {
-            margin-top: 30px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.9);
-            border-radius: 15px;
-            border: 1px solid #e9ecef;
-        }
-
-        .action-buttons {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 20px;
-        }
-
-        .action-group {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            border: 1px solid #dee2e6;
-        }
-
-        .action-group h4 {
-            margin: 0 0 15px 0;
-            color: #495057;
-            font-size: 1.1em;
-            text-align: center;
-            border-bottom: 2px solid #e9ecef;
-            padding-bottom: 8px;
-        }
-
+        .actions-grid.show { display: grid; }
         .action-btn {
             background: linear-gradient(135deg, #28a745, #20c997);
-            color: white;
-            border: none;
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-size: 14px;
-            cursor: pointer;
-            margin: 5px;
-            transition: all 0.3s ease;
-            box-shadow: 0 2px 8px rgba(40, 167, 69, 0.2);
-            min-width: 100px;
+            color: white; border: none; border-radius: 10px;
+            padding: 10px 6px; font-size: 13px; cursor: pointer;
+            transition: transform 0.15s;
         }
-
-        .action-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(40, 167, 69, 0.3);
-        }
-
-        .action-btn:active {
-            transform: translateY(0);
+        .action-btn:active { transform: scale(0.95); }
+        .action-group-title {
+            grid-column: 1 / -1; font-size: 0.8em;
+            color: #666; font-weight: 600; padding: 4px 0 2px;
+            border-bottom: 1px solid #e9ecef; margin-bottom: 2px;
         }
 
         @media (max-width: 480px) {
-            .container {
-                padding: 20px;
-                margin: 10px;
-            }
-
-            .joystick-container {
-                width: 320px;
-                height: 320px;
-            }
-
-            .joystick {
-                width: 96px;
-                height: 96px;
-            }
-
-            h1 {
-                font-size: 1.8em;
-            }
-
-            .action-buttons {
-                grid-template-columns: 1fr;
-                gap: 15px;
-            }
-
-            .action-btn {
-                font-size: 13px;
-                padding: 8px 12px;
-                min-width: 80px;
-            }
+            .container { padding: 8px 10px 12px; }
+            .header h1 { font-size: 1em; }
+            .joystick-wrap { max-width: 240px; }
+            .action-btn { font-size: 12px; padding: 9px 5px; }
         }
     </style>
 </head>
 <body>
+    <!-- 浮动提示（不覆盖状态栏） -->
+    <div class="toast" id="toast"></div>
     <div class="container">
-        <h1>🚗 小智小车遥控器</h1>
-        <div class="subtitle">触摸或拖拽摇杆控制小车移动</div>
-
-        <div class="joystick-container" id="joystick-container">
-            <div class="joystick" id="joystick"></div>
-            <div class="direction-indicator" id="direction-indicator">⏹️</div>
+        <div class="header">
+            <h1>小智小车遥控器</h1>
+            <div class="subtitle">拖拽摇杆控制方向</div>
         </div>
 
-        <div class="status connected" id="status">
-            <strong>状态:</strong> <span id="status-text">已连接</span>
+        <!-- 视频控制栏 -->
+        <div class="video-bar">
+            <div class="left">
+                <div class="status-dot" id="video-dot"></div>
+                <div class="label" id="video-label">视频流未连接</div>
+                <div class="remote-badge" id="remote-badge">遥控已连接</div>
+            </div>
+            <button class="bar-btn" id="btn-stream-toggle" onclick="toggleStream()">📷 开启</button>
         </div>
 
-        <div class="controls">
-            <button class="control-btn stop-btn" onclick="stopCar()">🛑 停止</button>
-            <a href="/config" class="control-btn" style="background: linear-gradient(135deg, #FF9800, #F57C00);">⚙️ 配置</a>
+        <!-- 视频面板（开启时显示） -->
+        <div class="video-panel" id="video-panel">
+            <div id="stream-container"></div>
+            <div class="video-actions">
+                <button class="act-btn" id="btn-settings" onclick="toggleSettings()">⚙ 设置</button>
+                <button class="act-btn photo" onclick="takePhoto()">📷 拍照</button>
+            </div>
+            <div class="flip-options" id="flip-options">
+                <button class="flip-toggle" id="btn-h-mirror" onclick="toggleFlip('h_mirror')">↔ 水平</button>
+                <button class="flip-toggle" id="btn-v-flip" onclick="toggleFlip('v_flip')">↕ 垂直</button>
+            </div>
         </div>
 
+        <!-- 摇杆（居中） -->
+        <div class="joystick-section">
+            <div class="joystick-wrap">
+                <div class="joystick-container" id="joystick-container">
+                    <div class="joystick" id="joystick"></div>
+                    <div class="direction-indicator" id="direction-indicator">⏹</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部按钮：停止、配置 -->
+        <div class="bottom-bar">
+            <button class="bottom-btn stop" onclick="stopCar()">🛑 停止</button>
+            <a href="/config" class="bottom-btn config">⚙ 配置</a>
+        </div>
+
+        <!-- 动作控制（可折叠，默认折叠） -->
         <div class="actions-section">
-            <h3 style="color: #333; margin: 20px 0 15px 0; text-align: center;">🎭 动作控制</h3>
-
-            <div class="action-buttons">
-                <!-- 基本移动动作 -->
-                <div class="action-group">
-                    <h4>🚗 基本移动</h4>
-                    <button class="action-btn" onclick="executeAction('move_forward')">⬆️ 前进</button>
-                    <button class="action-btn" onclick="executeAction('move_backward')">⬇️ 后退</button>
-                    <button class="action-btn" onclick="executeAction('turn_left')">⬅️ 左转</button>
-                    <button class="action-btn" onclick="executeAction('turn_right')">➡️ 右转</button>
-                    <button class="action-btn" onclick="executeAction('spin_around')">🔄 转圈</button>
-                </div>
-
-                <!-- 情感动作 -->
-                <div class="action-group">
-                    <h4>😊 情感表达</h4>
-                    <button class="action-btn" onclick="executeAction('wake_up')">🌅 唤醒</button>
-                    <button class="action-btn" onclick="executeAction('happy')">😄 开心</button>
-                    <button class="action-btn" onclick="executeAction('sad')">😢 悲伤</button>
-                    <button class="action-btn" onclick="executeAction('thinking')">🤔 思考</button>
-                    <button class="action-btn" onclick="executeAction('listening')">👂 倾听</button>
-                    <button class="action-btn" onclick="executeAction('speaking')">💬 说话</button>
-                    <button class="action-btn" onclick="executeAction('wiggle')">🌊 摆动</button>
-                    <button class="action-btn" onclick="executeAction('dance')">💃 跳舞</button>
-                </div>
-
-                <!-- 高级情感 -->
-                <div class="action-group">
-                    <h4>🎭 高级情感</h4>
-                    <button class="action-btn" onclick="executeAction('excited')">🤩 兴奋</button>
-                    <button class="action-btn" onclick="executeAction('loving')">😍 爱慕</button>
-                    <button class="action-btn" onclick="executeAction('angry')">😠 生气</button>
-                    <button class="action-btn" onclick="executeAction('surprised')">😲 惊讶</button>
-                    <button class="action-btn" onclick="executeAction('confused')">😕 困惑</button>
-                </div>
+            <div class="actions-header" onclick="toggleActions()">
+                <h3>🎭 动作控制</h3>
+                <span class="arrow" id="actions-arrow">▼</span>
+            </div>
+            <div class="actions-grid" id="actions-grid">
+                <div class="action-group-title">🚗 基本移动</div>
+                <button class="action-btn" onclick="executeAction('move_forward')">⬆ 前进</button>
+                <button class="action-btn" onclick="executeAction('move_backward')">⬇ 后退</button>
+                <button class="action-btn" onclick="executeAction('turn_left')">⬅ 左转</button>
+                <button class="action-btn" onclick="executeAction('turn_right')">➡ 右转</button>
+                <button class="action-btn" onclick="executeAction('spin_around')">🔄 转圈</button>
+                <div class="action-group-title">😊 情感表达</div>
+                <button class="action-btn" onclick="executeAction('wake_up')">🌅 唤醒</button>
+                <button class="action-btn" onclick="executeAction('happy')">😄 开心</button>
+                <button class="action-btn" onclick="executeAction('sad')">😢 悲伤</button>
+                <button class="action-btn" onclick="executeAction('thinking')">🤔 思考</button>
+                <button class="action-btn" onclick="executeAction('listening')">👂 倾听</button>
+                <button class="action-btn" onclick="executeAction('speaking')">💬 说话</button>
+                <button class="action-btn" onclick="executeAction('wiggle')">🌊 摆动</button>
+                <button class="action-btn" onclick="executeAction('dance')">💃 跳舞</button>
+                <div class="action-group-title">🎭 高级情感</div>
+                <button class="action-btn" onclick="executeAction('excited')">🤩 兴奋</button>
+                <button class="action-btn" onclick="executeAction('loving')">😍 爱慕</button>
+                <button class="action-btn" onclick="executeAction('angry')">😠 生气</button>
+                <button class="action-btn" onclick="executeAction('surprised')">😲 惊讶</button>
+                <button class="action-btn" onclick="executeAction('confused')">😕 困惑</button>
             </div>
         </div>
     </div>
 
     <script>
+        // 摇杆变量
         let joystick = document.getElementById('joystick');
         let joystickContainer = document.getElementById('joystick-container');
         let directionIndicator = document.getElementById('direction-indicator');
-        let statusText = document.getElementById('status-text');
-
+        let remoteBadge = document.getElementById('remote-badge');
         let isDragging = false;
-        let centerX = 0;
-        let centerY = 0;
         let currentDirection = 0;
         let currentSpeed = 0;
-        let isRequestPending = false; // 防止并发请求
+        let isRequestPending = false;
 
+        // 视频流变量
+        let streamState = 'idle'; // idle | opening | open | closing
+        let settingsOpen = false;
+        let actionsOpen = false;
+        const videoDot = document.getElementById('video-dot');
+        const videoLabel = document.getElementById('video-label');
+        const videoPanel = document.getElementById('video-panel');
+        const btnStreamToggle = document.getElementById('btn-stream-toggle');
+        const flipOptions = document.getElementById('flip-options');
+        const actionsGrid = document.getElementById('actions-grid');
+        const actionsArrow = document.getElementById('actions-arrow');
+        const streamContainer = document.getElementById('stream-container');
+        let streamImg = null; // 动态创建的 img 元素
+        let streamLoadTimer = null;
 
-        // 初始化摇杆中心位置
-        function initJoystick() {
-            const rect = joystickContainer.getBoundingClientRect();
-            centerX = rect.left + rect.width / 2;
-            centerY = rect.top + rect.height / 2;
+        // 浮动提示
+        let toastTimer = null;
+        function showToast(msg, isError) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast show' + (isError ? ' error' : '');
+            if (toastTimer) clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => { t.className = 'toast'; }, 2000);
         }
 
-        // 更新摇杆位置
+        // 摇杆事件
+        function initJoystick() {}
+
         function updateJoystickPosition(x, y) {
             const rect = joystickContainer.getBoundingClientRect();
-            const containerCenterX = rect.left + rect.width / 2;
-            const containerCenterY = rect.top + rect.height / 2;
-
-            // 计算相对于容器的位置
-            let relativeX = x - containerCenterX;
-            let relativeY = y - containerCenterY;
-
-            // 限制在圆形范围内
-            const maxRadius = rect.width / 2 - 56;
-            const distance = Math.sqrt(relativeX * relativeX + relativeY * relativeY);
-
-            if (distance > maxRadius) {
-                relativeX = (relativeX / distance) * maxRadius;
-                relativeY = (relativeY / distance) * maxRadius;
-            }
-
-            // 更新摇杆位置
-            joystick.style.left = `calc(50% + ${relativeX}px)`;
-            joystick.style.top = `calc(50% + ${relativeY}px)`;
-
-            // 计算方向和速度
-            const normalizedX = relativeX / maxRadius;
-            const normalizedY = relativeY / maxRadius;
-
-            // 计算方向角度 (0-360度)
-            let angle = Math.atan2(normalizedY, normalizedX) * (180 / Math.PI);
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            let rx = x - cx;
+            let ry = y - cy;
+            const maxR = rect.width / 2 - 30;
+            const dist = Math.sqrt(rx * rx + ry * ry);
+            if (dist > maxR) { rx = (rx / dist) * maxR; ry = (ry / dist) * maxR; }
+            joystick.style.left = `calc(50% + ${rx}px)`;
+            joystick.style.top = `calc(50% + ${ry}px)`;
+            const nx = rx / maxR, ny = ry / maxR;
+            let angle = Math.atan2(ny, nx) * (180 / Math.PI);
             if (angle < 0) angle += 360;
-
-            // 计算速度 (0-100)
-            const speed = Math.min(distance / maxRadius, 1) * 100;
-
-            // 转换方向为整数值
-            let direction = 0; // 停止
-            if (speed > 5) { // 最小阈值 (降低阈值以响应点击)
-                if (angle >= 315 || angle < 45) {
-                    direction = 1; // 右
-                } else if (angle >= 45 && angle < 135) {
-                    direction = 2; // 下
-                } else if (angle >= 135 && angle < 225) {
-                    direction = 3; // 左
-                } else if (angle >= 225 && angle < 315) {
-                    direction = 4; // 上
-                }
+            const speed = Math.min(dist / maxR, 1) * 100;
+            let dir = 0;
+            if (speed > 5) {
+                if (angle >= 315 || angle < 45) dir = 1;
+                else if (angle >= 45 && angle < 135) dir = 2;
+                else if (angle >= 135 && angle < 225) dir = 3;
+                else dir = 4;
             }
-
-            return { direction, speed: Math.round(speed) };
+            return { direction: dir, speed: Math.round(speed) };
         }
 
-        // 更新方向指示器
-        function updateDirectionIndicator(direction, speed) {
-            let icon = '⏹️';
-            let text = '停止';
-
+        function updateDirectionIndicator(dir, speed) {
+            let icon = '⏹';
             if (speed > 5) {
-                switch(direction) {
-                    case 1: icon = '➡️'; text = '右转'; break;
-                    case 2: icon = '⬇️'; text = '后退'; break;
-                    case 3: icon = '⬅️'; text = '左转'; break;
-                    case 4: icon = '⬆️'; text = '前进'; break;
+                switch(dir) {
+                    case 1: icon = '➡'; break;
+                    case 2: icon = '⬇'; break;
+                    case 3: icon = '⬅'; break;
+                    case 4: icon = '⬆'; break;
                 }
             }
-
             directionIndicator.textContent = icon;
             directionIndicator.classList.toggle('active', speed > 5);
         }
 
-        // 发送控制命令
-        // 发送控制命令
-        async function sendControl(direction, speed) {
-            // 停止命令(0, 0)优先处理，不受并发限制
-            if (direction === 0 && speed === 0) {
-                currentDirection = 0;
-                currentSpeed = 0;
+        async function sendControl(dir, speed) {
+            if (dir === 0 && speed === 0) {
+                currentDirection = 0; currentSpeed = 0;
                 try {
-                    const response = await fetch('/api/control', {
+                    const r = await fetch('/api/control', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            direction: 0,
-                            speed: 0
-                        })
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ direction: 0, speed: 0 })
                     });
-                    if (!response.ok) {
-                        throw new Error('Network response was not ok');
-                    }
-                    statusText.textContent = '已连接';
-                    document.getElementById('status').className = 'status connected';
-                } catch (error) {
-                    console.error('Failed to send stop control:', error);
-                    statusText.textContent = '连接错误';
-                    document.getElementById('status').className = 'status error';
+                    if (!r.ok) throw new Error();
+                } catch (e) {
+                    showToast('发送失败', true);
                 }
                 return;
             }
-
-            if (direction === currentDirection && speed === currentSpeed) {
-                return; // 避免重复发送相同命令
-            }
-
-            // 如果有请求正在进行中，跳过
-            if (isRequestPending) {
-                return;
-            }
-
-            currentDirection = direction;
-            currentSpeed = speed;
+            if (dir === currentDirection && speed === currentSpeed) return;
+            if (isRequestPending) return;
+            currentDirection = dir; currentSpeed = speed;
             isRequestPending = true;
-
             try {
-                const response = await fetch('/api/control', {
+                const r = await fetch('/api/control', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        direction: direction,
-                        speed: speed
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ direction: dir, speed: speed })
                 });
-
-                if (!response.ok) {
-                    throw new Error('Network response was not ok');
-                }
-
-                statusText.textContent = '已连接';
-                document.getElementById('status').className = 'status connected';
-            } catch (error) {
-                console.error('Failed to send control:', error);
-                statusText.textContent = '连接错误';
-                document.getElementById('status').className = 'status error';
+                if (!r.ok) throw new Error();
+                remoteBadge.textContent = '遥控已连接';
+                remoteBadge.style.background = '#d4edda';
+                remoteBadge.style.color = '#155724';
+            } catch (e) {
+                remoteBadge.textContent = '连接断开';
+                remoteBadge.style.background = '#f8d7da';
+                remoteBadge.style.color = '#721c24';
+                showToast('发送失败', true);
             } finally {
                 isRequestPending = false;
             }
         }
 
-        // 停止小车
         function stopCar() {
-            // 重置状态
             isDragging = false;
-            currentDirection = 0;
-            currentSpeed = 0;
-
-            // 重置UI
-            joystick.style.left = '50%';
-            joystick.style.top = '50%';
+            currentDirection = 0; currentSpeed = 0;
+            joystick.style.left = '50%'; joystick.style.top = '50%';
             joystick.classList.remove('active');
             updateDirectionIndicator(0, 0);
-
-            // 发送停止命令
             sendControl(0, 0);
         }
 
-
-        // 执行电机动作
         async function executeAction(action) {
             try {
-                const response = await fetch('/api/motor/action', {
+                const r = await fetch('/api/motor/action', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        action: action
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: action })
                 });
-
-                if (!response.ok) {
-                    throw new Error('Network response was not ok');
-                }
-
-                const result = await response.json();
-                console.log('Action executed:', action, result);
-
-                // 更新状态显示
-                statusText.textContent = '动作执行成功';
-                document.getElementById('status').className = 'status connected';
-
-            } catch (error) {
-                console.error('Failed to execute action:', action, error);
-                statusText.textContent = '动作执行失败';
-                document.getElementById('status').className = 'status disconnected';
+                if (!r.ok) throw new Error();
+                showToast('已执行', false);
+                // 延迟后恢复默认表情
+                setTimeout(async () => {
+                    try {
+                        await fetch('/api/emotion', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ emotion: 'neutral' })
+                        });
+                    } catch (e) {}
+                }, 3000);
+            } catch (e) {
+                showToast('执行失败', true);
             }
         }
 
-        // 鼠标事件
+        // 摇杆事件绑定
         joystickContainer.addEventListener('mousedown', (e) => {
-            isDragging = true;
-            joystick.classList.add('active');
-            initJoystick();
+            isDragging = true; joystick.classList.add('active');
             const { direction, speed } = updateJoystickPosition(e.clientX, e.clientY);
             updateDirectionIndicator(direction, speed);
             sendControl(direction, speed);
         });
-
         document.addEventListener('mousemove', (e) => {
             if (isDragging) {
                 const { direction, speed } = updateJoystickPosition(e.clientX, e.clientY);
@@ -963,59 +1341,196 @@ const char* WebServer::get_html_page() {
                 sendControl(direction, speed);
             }
         });
-
-        document.addEventListener('mouseup', () => {
-            if (isDragging) {
-                stopCar();
-            }
-        });
-
-        // 触摸事件
+        document.addEventListener('mouseup', () => { if (isDragging) stopCar(); });
         joystickContainer.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            isDragging = true;
-            joystick.classList.add('active');
-            initJoystick();
-            const touch = e.touches[0];
-            const { direction, speed } = updateJoystickPosition(touch.clientX, touch.clientY);
+            e.preventDefault(); isDragging = true; joystick.classList.add('active');
+            const t = e.touches[0];
+            const { direction, speed } = updateJoystickPosition(t.clientX, t.clientY);
             updateDirectionIndicator(direction, speed);
             sendControl(direction, speed);
         });
-
         joystickContainer.addEventListener('touchmove', (e) => {
             e.preventDefault();
             if (isDragging) {
-                const touch = e.touches[0];
-                const { direction, speed } = updateJoystickPosition(touch.clientX, touch.clientY);
+                const t = e.touches[0];
+                const { direction, speed } = updateJoystickPosition(t.clientX, t.clientY);
                 updateDirectionIndicator(direction, speed);
                 sendControl(direction, speed);
             }
         });
-
         joystickContainer.addEventListener('touchend', (e) => {
-            e.preventDefault();
-            if (isDragging) {
-                stopCar();
-            }
+            e.preventDefault(); if (isDragging) stopCar();
         });
-
-        // 全局触摸结束事件，确保在任何地方松手都能停止
         document.addEventListener('touchend', (e) => {
-            if (isDragging && e.target !== joystick && e.target !== joystickContainer) {
-                stopCar();
-            }
+            if (isDragging && e.target !== joystick && e.target !== joystickContainer) stopCar();
         });
-
-        // 定期发送控制命令（当摇杆被拖拽时）
-        setInterval(() => {
-            if (isDragging) {
-                sendControl(currentDirection, currentSpeed);
-            }
-        }, 200); // 每200ms发送一次，减少服务器压力
-
-        // 初始化
-        initJoystick();
+        setInterval(() => { if (isDragging) sendControl(currentDirection, currentSpeed); }, 200);
         window.addEventListener('resize', initJoystick);
+
+        // 视频流控制 - 使用 MJPEG 长连接，服务端限帧 10fps
+        let maxStreamRetries = 1; // 首次连接失败后仅重试1次
+        function startStream() {
+            if (streamState !== 'idle') return;
+            streamState = 'opening';
+
+            // 销毁旧 img
+            if (streamImg) {
+                streamImg.onload = null;
+                streamImg.onerror = null;
+                streamImg.src = '';
+                streamImg.remove();
+                streamImg = null;
+            }
+            streamContainer.innerHTML = '';
+
+            // 创建 img 元素
+            streamImg = document.createElement('img');
+            streamImg.style.width = '100%';
+            streamImg.style.display = 'block';
+            streamContainer.appendChild(streamImg);
+
+            // 立即展开视频面板
+            videoPanel.classList.add('show');
+            videoLabel.textContent = '加载中...';
+            videoLabel.classList.add('active');
+            videoDot.classList.remove('on');
+            btnStreamToggle.textContent = '📷 关闭';
+            settingsOpen = false;
+            flipOptions.classList.remove('show');
+
+            // 先绑定事件，再设置 src（避免 race condition）
+            var streamUrl = window.location.protocol + '//' + window.location.hostname + ':81/stream?' + Date.now() + '_' + Math.random();
+            console.log('[Stream] Connecting to:', streamUrl);
+            streamImg.onload = function() {
+                console.log('[Stream] onload - connected');
+                videoDot.classList.add('on');
+                videoLabel.textContent = '视频流已连接';
+                streamState = 'open';
+                if (streamLoadTimer) clearTimeout(streamLoadTimer);
+                loadFlipStates();
+            };
+            streamImg.onerror = function() {
+                console.log('[Stream] onerror - failed, retries left:', maxStreamRetries);
+                videoDot.classList.remove('on');
+                videoLabel.classList.remove('active');
+                if (streamLoadTimer) clearTimeout(streamLoadTimer);
+                if (maxStreamRetries > 0) {
+                    maxStreamRetries--;
+                    streamState = 'idle';
+                    videoLabel.textContent = '连接中... (重试)';
+                    setTimeout(function() {
+                        if (streamState === 'idle') startStream();
+                    }, 800);
+                } else {
+                    videoLabel.textContent = '视频流不可用';
+                    streamState = 'idle';
+                    btnStreamToggle.textContent = '📷 开启';
+                }
+            };
+            // 直接设置真实流 URL（移除透明 GIF 中间步骤）
+            streamImg.src = streamUrl;
+
+            // 超时检测（15秒，给首次连接更多时间）
+            streamLoadTimer = setTimeout(() => {
+                if (streamState === 'opening') {
+                    console.log('[Stream] Timeout after 15s');
+                    videoLabel.textContent = '视频流不可用';
+                    videoLabel.classList.remove('active');
+                    videoDot.classList.remove('on');
+                    streamState = 'idle';
+                    btnStreamToggle.textContent = '📷 开启';
+                }
+            }, 15000);
+        }
+
+        function stopStream() {
+            if (streamState !== 'open' && streamState !== 'opening') return;
+            streamState = 'closing';
+            if (streamLoadTimer) clearTimeout(streamLoadTimer);
+
+            videoLabel.textContent = '正在关闭...';
+            videoLabel.classList.add('active');
+            videoDot.classList.remove('on');
+            btnStreamToggle.textContent = '📷 关闭中';
+
+            // 关闭 img src 断开连接，等待 500ms 后刷新页面确保连接彻底清理
+            if (streamImg) {
+                streamImg.src = '';
+            }
+            setTimeout(() => {
+                window.location.reload();
+            }, 500);
+        }
+
+        function toggleStream() {
+            streamState === 'idle' ? startStream() : stopStream();
+        }
+
+        // 设置面板（展开/折叠翻转选项）
+        function toggleSettings() {
+            settingsOpen = !settingsOpen;
+            flipOptions.classList.toggle('show', settingsOpen);
+        }
+
+        // 动作控制折叠/展开
+        function toggleActions() {
+            actionsOpen = !actionsOpen;
+            actionsGrid.classList.toggle('show', actionsOpen);
+            actionsArrow.classList.toggle('open', actionsOpen);
+        }
+
+        // 翻转控制（独立状态）
+        async function loadFlipStates() {
+            try {
+                const resp = await fetch('/api/camera/flip');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                document.getElementById('btn-h-mirror').classList.toggle('active', data.h_mirror);
+                document.getElementById('btn-h-mirror').dataset.state = data.h_mirror ? '1' : '0';
+                document.getElementById('btn-v-flip').classList.toggle('active', data.v_flip);
+                document.getElementById('btn-v-flip').dataset.state = data.v_flip ? '1' : '0';
+            } catch (e) { console.log('Flip load error:', e); }
+        }
+
+        async function toggleFlip(key) {
+            const hBtn = document.getElementById('btn-h-mirror');
+            const vBtn = document.getElementById('btn-v-flip');
+            const hCur = hBtn.dataset.state === '1';
+            const vCur = vBtn.dataset.state === '1';
+            const hNew = key === 'h_mirror' ? !hCur : hCur;
+            const vNew = key === 'v_flip' ? !vCur : vCur;
+            try {
+                const resp = await fetch('/api/camera/flip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ h_mirror: hNew, v_flip: vNew })
+                });
+                if (!resp.ok) return;
+                const data = await resp.json();
+                hBtn.classList.toggle('active', data.h_mirror);
+                hBtn.dataset.state = data.h_mirror ? '1' : '0';
+                vBtn.classList.toggle('active', data.v_flip);
+                vBtn.dataset.state = data.v_flip ? '1' : '0';
+            } catch (e) { console.error('Flip error:', e); }
+        }
+
+        // 拍照（浮动提示，不覆盖状态栏）
+        async function takePhoto() {
+            try {
+                const resp = await fetch('/api/camera/photo?' + Date.now());
+                if (!resp.ok) throw new Error();
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'photo_' + Date.now() + '.jpg';
+                a.click();
+                URL.revokeObjectURL(url);
+                showToast('拍照成功', false);
+            } catch (e) {
+                showToast('拍照失败', true);
+            }
+        }
     </script>
 </body>
 </html>

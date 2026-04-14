@@ -35,11 +35,16 @@ private:
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
     int video_fd_ = -1;
     bool streaming_on_ = false;
+    bool h_mirror_ = false;
+    bool v_flip_ = false;
     struct MmapBuffer { void *start = nullptr; size_t length = 0; };
     std::vector<MmapBuffer> mmap_buffers_;
     std::string explain_url_;
     std::string explain_token_;
     std::thread encoder_thread_;
+    // 流媒体预分配缓冲区（避免每次 CaptureStreamFrame 都 malloc/free）
+    uint8_t* stream_buf_ = nullptr;
+    size_t stream_buf_size_ = 0;
 
 public:
     Esp32Camera(const esp_video_init_config_t& config);
@@ -50,7 +55,21 @@ public:
     // 翻转控制函数
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
+    bool IsHMirror() const { return h_mirror_; }
+    bool IsVFlip() const { return v_flip_; }
+    // JPEG 质量控制
+    bool SetJpegQuality(int quality);
     virtual std::string Explain(const std::string& question);
+
+    // 获取当前帧的 JPEG 数据（用于视频流）
+    const uint8_t* GetFrameData() const { return frame_.data; }
+    size_t GetFrameSize() const { return frame_.len; }
+    uint16_t GetFrameWidth() const { return frame_.width; }
+    uint16_t GetFrameHeight() const { return frame_.height; }
+
+    // 轻量级流媒体帧捕获：直接从 mmap 缓冲区读取 JPEG 数据，
+    // 跳过 LVGL 预览解码和 PSRAM 分配。仅适用于 JPEG 格式摄像头。
+    bool CaptureStreamFrame();
 };
 
 #endif // ndef CONFIG_IDF_TARGET_ESP32

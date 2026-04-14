@@ -4,13 +4,19 @@
         {
             "name": "qebabe-xiaoche",
             "sdkconfig_append": [
-                "CONFIG_OLED_SSD1306_128X32=y"
+                "CONFIG_OLED_SSD1306_128X32=y",
+                "CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS=y",
+                "CONFIG_CAMERA_OV2640_DVP_IF_FORMAT_INDEX_DEFAULT=2",
+                "CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT=y"
             ]
         },
         {
             "name": "qebabe-xiaoche-128x64",
             "sdkconfig_append": [
-                "CONFIG_OLED_SSD1306_128X64=y"
+                "CONFIG_OLED_SSD1306_128X64=y",
+                "CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS=y",
+                "CONFIG_CAMERA_OV2640_DVP_IF_FORMAT_INDEX_DEFAULT=2",
+                "CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT=y"
             ]
         }
 

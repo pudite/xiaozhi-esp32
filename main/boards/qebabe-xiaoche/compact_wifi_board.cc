@@ -10,6 +10,7 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include <wifi_manager.h>
+#include "esp32_camera.h"
 
 // Forward declaration for Application function
 extern "C" void HandleMotorActionForApplication(int direction, int speed, int duration_ms, int priority);
@@ -35,10 +36,12 @@ extern "C" void HandleMotorActionForDance(uint8_t speed_percent);
 class CompactWifiBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_;
+    i2c_master_bus_handle_t camera_i2c_bus_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
     Button boot_button_;
+    Esp32Camera* camera_ = nullptr;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -120,6 +123,63 @@ private:
             app.ToggleChatState();
         });
         // 触摸按钮和音量按钮已取消，不再初始化
+    }
+
+    void InitializeCamera() {
+        // Initialize dedicated I2C bus for camera SCCB (GPIO4/5)
+        // Separate from display I2C (GPIO43/44) - no conflict
+        i2c_master_bus_config_t camera_i2c_cfg = {
+            .i2c_port = (i2c_port_t)1,
+            .sda_io_num = CAMERA_PIN_SIOD,
+            .scl_io_num = CAMERA_PIN_SIOC,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&camera_i2c_cfg, &camera_i2c_bus_));
+
+        // DVP pin configuration
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = false,
+            .i2c_handle = camera_i2c_bus_,
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
     }
 
     // 物联网初始化，逐步迁移到 MCP 协议
@@ -507,6 +567,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
+        InitializeCamera();
         InitializeTools();
     }
     virtual AudioCodec* GetAudioCodec() override {
@@ -522,6 +583,10 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 
     // Motor control interface for different emotions and actions

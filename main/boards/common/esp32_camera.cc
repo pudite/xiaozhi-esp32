@@ -355,6 +355,12 @@ Esp32Camera::Esp32Camera(const esp_video_init_config_t& config) {
         },
         "CameraInitTask", 4096, this, 5, nullptr);
 #else
+    // 设置 JPEG 质量
+    // esp_video 的 quality 范围 1-63，值越大质量越高（内部 QS = 63 - quality）
+    // 默认 quality=46 (QS=17) 产生 ~14KB 的 640x480 JPEG
+    // 设为 52 (QS=11) 以平衡画质和传输延迟，640x480 下约 30KB
+    SetJpegQuality(52);
+
     ESP_LOGI(TAG, "Camera init success");
     streaming_on_ = true;
 #endif  // CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
@@ -375,6 +381,11 @@ Esp32Camera::~Esp32Camera() {
         video_fd_ = -1;
     }
     sensor_format_ = 0;
+    if (stream_buf_) {
+        heap_caps_free(stream_buf_);
+        stream_buf_ = nullptr;
+        stream_buf_size_ = 0;
+    }
     esp_video_deinit();
 }
 
@@ -402,12 +413,57 @@ bool Esp32Camera::Capture() {
         }
         if (i == 2) {
             // 保存帧副本到PSRAM
-            if (frame_.data) {
+            // 注意：不要释放 stream_buf_（流媒体缓冲区），它由 CaptureStreamFrame 管理
+            if (frame_.data && frame_.data != stream_buf_) {
                 heap_caps_free(frame_.data);
-                frame_.data = nullptr;
-                frame_.format = 0;
             }
+            frame_.data = nullptr;
+            frame_.format = 0;
             frame_.len = buf.bytesused;
+            // 对于JPEG格式，某些驱动不报告bytesused（值为0），需要手动搜索EOI标记确定实际大小
+            if (frame_.len == 0) {
+#ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
+                if (sensor_format_ == V4L2_PIX_FMT_JPEG) {
+                    uint8_t* buf_start = (uint8_t*)mmap_buffers_[buf.index].start;
+                    size_t buf_len = mmap_buffers_[buf.index].length;
+
+                    if (buf_start[0] == 0xFF && buf_start[1] == 0xD8) {
+                        const size_t MAX_JPEG_SIZE = 100000;
+                        size_t search_end = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
+                        size_t pos = search_end - 2;
+
+                        while (pos > 0) {
+                            if (buf_start[pos] == 0xFF) {
+                                if (buf_start[pos + 1] == 0x00) {
+                                    pos -= 2;  // 跳过 byte-stuffed 0xFF
+                                    continue;
+                                }
+                                if (buf_start[pos + 1] == 0xD9) {
+                                    frame_.len = pos + 2;
+                                    break;
+                                }
+                            }
+                            pos--;
+                        }
+                    }
+                    if (frame_.len == 0) {
+                        ESP_LOGE(TAG, "JPEG format: no valid EOI found, buf_len=%lu", buf_len);
+                        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                            ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                        }
+                        return false;
+                    }
+                    ESP_LOGD(TAG, "JPEG format: found EOI at %lu bytes", frame_.len);
+                } else
+#endif
+                {
+                    ESP_LOGE(TAG, "alloc frame copy failed: need allocate 0 bytes");
+                    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                        ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                    }
+                    return false;
+                }
+            }
             frame_.data = (uint8_t*)heap_caps_malloc(frame_.len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!frame_.data) {
                 ESP_LOGE(TAG, "alloc frame copy failed: need allocate %lu bytes", buf.bytesused);
@@ -838,6 +894,160 @@ bool Esp32Camera::Capture() {
     return true;
 }
 
+/**
+ * @brief 轻量级流媒体帧捕获
+ *
+ * 直接从 mmap 缓冲区读取 JPEG 数据到预分配的 PSRAM 缓冲区，
+ * 跳过 LVGL 预览解码。专为 MJPEG 视频流设计，避免 Capture()
+ * 中的 JPEG 软解码（~500ms CPU）导致的帧率过低和 SRAM 不足问题。
+ */
+bool Esp32Camera::CaptureStreamFrame() {
+    if (!streaming_on_ || video_fd_ < 0) {
+        ESP_LOGW(TAG, "CSF: not streaming or fd invalid, streaming_on=%d, fd=%d", streaming_on_, video_fd_);
+        return false;
+    }
+
+    // 仅支持 JPEG 格式
+#ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
+    if (sensor_format_ != V4L2_PIX_FMT_JPEG)
+#endif
+    {
+        // 非 JPEG 格式，回退到完整 Capture
+        ESP_LOGW(TAG, "CSF: falling back to Capture(), sensor_format=0x%08lx", sensor_format_);
+        return Capture();
+    }
+
+    ESP_LOGD(TAG, "CSF: start");
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    // Dequeue 缓冲区（丢弃旧帧获取最新的）
+    if (ioctl(video_fd_, VIDIOC_DQBUF, &buf) != 0) {
+        ESP_LOGW(TAG, "CSF: DQBUF failed errno=%d", errno);
+        return false;
+    }
+    ESP_LOGD(TAG, "CSF: DQBUF idx=%u bytesused=%u", buf.index, buf.bytesused);
+
+    // bytesused 在 OV2640 JPEG 格式下正常值为 0，此时需手动搜索 EOI
+    // 非零值需要验证：基于分辨率动态计算阈值，避免硬编码
+    // JPEG 压缩后通常不到未压缩数据的一半，取 width*height/2 作为安全上限
+    size_t jpeg_size = buf.bytesused;
+    if (jpeg_size > 0) {
+        uint16_t w = GetFrameWidth();
+        uint16_t h = GetFrameHeight();
+        size_t max_valid = (w > 0 && h > 0) ? ((size_t)w * h / 2) : 150000;
+        if (jpeg_size > max_valid) {
+            ESP_LOGD(TAG, "CSF: DQBUF invalid bytesused=%u > max %u (%ux%u), dropped",
+                     (unsigned)jpeg_size, (unsigned)max_valid, w, h);
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+            }
+            return false;
+        }
+    }
+
+#ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
+    // 当 bytesused=0 时，手动搜索 JPEG EOI 标记
+    if (jpeg_size == 0) {
+        uint8_t* buf_start = (uint8_t*)mmap_buffers_[buf.index].start;
+        size_t buf_len = mmap_buffers_[buf.index].length;
+
+        if (buf_start[0] == 0xFF && buf_start[1] == 0xD8) {
+            const size_t MAX_JPEG_SIZE = 100000;
+            size_t search_end = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
+            size_t pos = search_end - 2;
+
+            while (pos > 0) {
+                if (buf_start[pos] == 0xFF) {
+                    if (buf_start[pos + 1] == 0x00) {
+                        pos -= 2;  // 跳过 byte-stuffed 0xFF
+                        continue;
+                    }
+                    if (buf_start[pos + 1] == 0xD9) {
+                        jpeg_size = pos + 2;
+                        break;
+                    }
+                }
+                pos--;
+            }
+        }
+        if (jpeg_size == 0) {
+            ESP_LOGD(TAG, "CSF: no valid JPEG found, buf_len=%u", (unsigned)buf_len);
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+            }
+            return false;
+        }
+    }
+#endif
+
+    if (jpeg_size == 0) {
+        ESP_LOGW(TAG, "CSF: no JPEG found");
+        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+        }
+        return false;
+    }
+
+    // 预分配足够大的缓冲区，避免每次 malloc/free
+    if (stream_buf_ == nullptr || stream_buf_size_ < jpeg_size) {
+        if (stream_buf_) {
+            heap_caps_free(stream_buf_);
+            stream_buf_ = nullptr;
+            stream_buf_size_ = 0;
+        }
+        stream_buf_size_ = jpeg_size;
+        stream_buf_ = (uint8_t*)heap_caps_malloc(stream_buf_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!stream_buf_) {
+            ESP_LOGE(TAG, "CSF: alloc %u bytes failed", (unsigned)stream_buf_size_);
+            stream_buf_size_ = 0;
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+            }
+            return false;
+        }
+        ESP_LOGI(TAG, "CSF: stream_buf allocated %u bytes", (unsigned)stream_buf_size_);
+    }
+
+    // 从 mmap 缓冲区复制数据
+    memcpy(stream_buf_, mmap_buffers_[buf.index].start, jpeg_size);
+    frame_.data = stream_buf_;
+    frame_.len = jpeg_size;
+    frame_.format = sensor_format_;
+
+    // 重新入队缓冲区
+    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+        ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+    }
+
+    ESP_LOGD(TAG, "CSF: OK jpeg_size=%u", (unsigned)jpeg_size);
+    return true;
+}
+
+bool Esp32Camera::SetJpegQuality(int quality) {
+    if (video_fd_ < 0)
+        return false;
+    // quality: 1-63 (OV2640, 值越小质量越高)
+    if (quality < 1 || quality > 63)
+        return false;
+
+    struct v4l2_ext_controls ctrls = {};
+    struct v4l2_ext_control ctrl = {};
+    ctrl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+    ctrl.value = quality;
+    ctrls.ctrl_class = V4L2_CTRL_CLASS_JPEG;
+    ctrls.count = 1;
+    ctrls.controls = &ctrl;
+
+    if (ioctl(video_fd_, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+        ESP_LOGW(TAG, "SetJpegQuality: VIDIOC_S_EXT_CTRLS failed, errno=%d", errno);
+        return false;
+    }
+    ESP_LOGI(TAG, "SetJpegQuality: set to %d", quality);
+    return true;
+}
+
 bool Esp32Camera::SetHMirror(bool enabled) {
     if (video_fd_ < 0)
         return false;
@@ -852,6 +1062,7 @@ bool Esp32Camera::SetHMirror(bool enabled) {
         ESP_LOGE(TAG, "set HFLIP failed");
         return false;
     }
+    h_mirror_ = enabled;
     return true;
 }
 
@@ -869,6 +1080,7 @@ bool Esp32Camera::SetVFlip(bool enabled) {
         ESP_LOGE(TAG, "set VFLIP failed");
         return false;
     }
+    v_flip_ = enabled;
     return true;
 }
 

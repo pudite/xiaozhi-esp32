@@ -63,4 +63,29 @@
 #define MOTOR_RF_GPIO GPIO_NUM_21  // Right Forward
 #define MOTOR_RB_GPIO GPIO_NUM_14  // Right Backward (was GPIO_NUM_3)
 
+// OV2640 Camera DVP interface pins (ESP32-S3-N16R8 onboard camera)
+// DVP 8-bit data + control signals: GPIO4-13, GPIO15-18
+#define CAMERA_PIN_PWDN     GPIO_NUM_NC
+#define CAMERA_PIN_RESET    GPIO_NUM_NC
+#define CAMERA_PIN_XCLK     GPIO_NUM_15
+#define CAMERA_PIN_SIOD     GPIO_NUM_4
+#define CAMERA_PIN_SIOC     GPIO_NUM_5
+
+#define CAMERA_PIN_D0       GPIO_NUM_11   // Y2
+#define CAMERA_PIN_D1       GPIO_NUM_9    // Y3
+#define CAMERA_PIN_D2       GPIO_NUM_8    // Y4
+#define CAMERA_PIN_D3       GPIO_NUM_10   // Y5
+#define CAMERA_PIN_D4       GPIO_NUM_12   // Y6
+#define CAMERA_PIN_D5       GPIO_NUM_18   // Y7
+#define CAMERA_PIN_D6       GPIO_NUM_17   // Y8
+#define CAMERA_PIN_D7       GPIO_NUM_16   // Y9
+#define CAMERA_PIN_VSYNC    GPIO_NUM_6
+#define CAMERA_PIN_HREF     GPIO_NUM_7
+#define CAMERA_PIN_PCLK     GPIO_NUM_13
+
+#define XCLK_FREQ_HZ        20000000
+
+// Note: Camera SCCB (GPIO4/5) uses separate I2C bus from display I2C (GPIO43/44).
+// Camera DVP data/control pins are independent of display I2C.
+
 #endif // _BOARD_CONFIG_H_
