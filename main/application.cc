@@ -366,6 +366,17 @@ void Application::Run() {
                 }
             }
 
+            // 电机安全看门狗：检测摇杆控制失联（前端断网/关页面）
+            // 使用 last_web_control_time_ms_（每次 HandleWebMotorControl 都更新，不受 dedup 影响）
+            if (realtime_control_active_.load() && last_web_control_time_ms_.load() > 0) {
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                int64_t elapsed_ms = now_ms - last_web_control_time_ms_.load();
+                if (elapsed_ms > WEB_CONTROL_WATCHDOG_MS) {
+                    ESP_LOGW(TAG, "Motor watchdog: no command for %lld ms, auto-stopping", (long long)elapsed_ms);
+                    StopRealtimeMotorControl();
+                }
+            }
+
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -522,13 +533,13 @@ void Application::HandleActivationDoneEvent() {
 
     // 电源管理回调（视频流期间强制高性能模式）
     web_server_->SetPowerSaveCallback(
-        [](bool performance) {
+        [this](bool performance) {
+            stream_active_.store(performance);
+            UpdatePowerSaveLevel();
             if (performance) {
-                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
                 ESP_LOGI(TAG, "Power save: PERFORMANCE mode (streaming active)");
             } else {
-                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-                ESP_LOGI(TAG, "Power save: LOW_POWER mode (streaming stopped)");
+                ESP_LOGI(TAG, "Power save: stream ended, checking if other activities need PERFORMANCE");
             }
         }
     );
@@ -2020,7 +2031,7 @@ void Application::SaveMotorActionConfig() {
 void Application::UpdatePowerSaveLevel() {
     std::lock_guard<std::mutex> lock(power_mutex_);
 
-    bool needs_performance = web_control_active_.load();
+    bool needs_performance = web_control_active_.load() || stream_active_.load();
 
     // 安全检查：protocol_可能为空
     if (protocol_) {
@@ -2037,11 +2048,20 @@ void Application::UpdatePowerSaveLevel() {
 
         const char* trigger = "unknown";
         if (new_level == PowerSaveLevel::PERFORMANCE) {
-            if (web_control_active_.load() && protocol_ && protocol_->IsAudioChannelOpened()) {
+            bool web = web_control_active_.load();
+            bool stream = stream_active_.load();
+            bool audio = protocol_ && protocol_->IsAudioChannelOpened();
+            if (web && audio) {
                 trigger = "web+audio";
-            } else if (web_control_active_.load()) {
+            } else if (stream && audio) {
+                trigger = "stream+audio";
+            } else if (web && stream) {
+                trigger = "web+stream";
+            } else if (web) {
                 trigger = "web";
-            } else if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            } else if (stream) {
+                trigger = "stream";
+            } else if (audio) {
                 trigger = "audio";
             }
         }

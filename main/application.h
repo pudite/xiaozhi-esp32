@@ -208,8 +208,11 @@ private:
     // WEB control state tracking for intelligent power management
     std::atomic<bool> web_control_active_{false};
     std::atomic<int64_t> last_web_control_time_ms_{0};
+    // Video stream state tracking (stream active also needs PERFORMANCE mode)
+    std::atomic<bool> stream_active_{false};
     PowerSaveLevel current_power_level_{PowerSaveLevel::LOW_POWER};
-    static constexpr int WEB_CONTROL_TIMEOUT_MS = 30000;
+    static constexpr int WEB_CONTROL_TIMEOUT_MS = 30000;     // 电源管理超时
+    static constexpr int WEB_CONTROL_WATCHDOG_MS = 500;      // 电机安全看门狗超时
     std::mutex power_mutex_;  // 保护电源状态更新
 
     // PWM (LEDC) support

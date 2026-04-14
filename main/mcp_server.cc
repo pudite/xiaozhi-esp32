@@ -109,8 +109,9 @@ void McpServer::AddCommonTools() {
                 Property("question", kPropertyTypeString)
             }),
             [camera](const PropertyList& properties) -> ReturnValue {
-                // Lower the priority to do the camera capture
-                TaskPriorityReset priority_reset(1);
+                // 保持与 Application 主任务相同的优先级，
+                // 确保能公平竞争 V4L2 缓冲区（与 httpd 视频流线程同优先级为 5）
+                TaskPriorityReset priority_reset(5);
 
                 if (!camera->Capture()) {
                     throw std::runtime_error("Failed to capture photo");

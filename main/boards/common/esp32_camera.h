@@ -13,6 +13,7 @@
 #include "camera.h"
 #include "jpg/image_to_jpeg.h"
 #include "esp_video_init.h"
+#include <mutex>
 
 struct JpegChunk {
     uint8_t* data;
@@ -45,6 +46,8 @@ private:
     // 流媒体预分配缓冲区（避免每次 CaptureStreamFrame 都 malloc/free）
     uint8_t* stream_buf_ = nullptr;
     size_t stream_buf_size_ = 0;
+    // 保护 frame_ 和 stream_buf_ 的多线程访问（httpd 并发请求）
+    mutable std::mutex frame_mutex_;
 
 public:
     Esp32Camera(const esp_video_init_config_t& config);
@@ -70,6 +73,10 @@ public:
     // 轻量级流媒体帧捕获：直接从 mmap 缓冲区读取 JPEG 数据，
     // 跳过 LVGL 预览解码和 PSRAM 分配。仅适用于 JPEG 格式摄像头。
     bool CaptureStreamFrame();
+
+    // 帧数据访问的锁保护（供 web_server 并发读取时使用）
+    void LockFrame() const { frame_mutex_.lock(); }
+    void UnlockFrame() const { frame_mutex_.unlock(); }
 };
 
 #endif // ndef CONFIG_IDF_TARGET_ESP32

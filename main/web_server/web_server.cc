@@ -78,7 +78,7 @@ bool WebServer::Start(int port) {
     };
     httpd_register_uri_handler(server_handle_, &api_motor_action_uri);
 
-    // 注意：/stream 处理器已移至独立的流媒体服务器（端口 8080）
+    // 注意：/stream 处理器已移至独立的流媒体服务器（端口 81）
 
     httpd_uri_t debug_uri = {
         .uri       = "/api/debug/motor_test",
@@ -284,19 +284,32 @@ esp_err_t WebServer::api_camera_photo_get_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    const uint8_t* jpeg_data = camera->GetFrameData();
+    // 在锁保护下读取帧尺寸，防止与 stream 并发写入冲突
+    camera->LockFrame();
     size_t jpeg_size = camera->GetFrameSize();
+    const uint8_t* jpeg_data = camera->GetFrameData();
+    // 复制数据到独立缓冲区，避免后续被其他线程覆盖
     if (!jpeg_data || jpeg_size == 0) {
+        camera->UnlockFrame();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Empty frame");
         return ESP_FAIL;
     }
+    uint8_t* jpeg_copy = (uint8_t*)heap_caps_malloc(jpeg_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_copy) {
+        camera->UnlockFrame();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+    memcpy(jpeg_copy, jpeg_data, jpeg_size);
+    camera->UnlockFrame();
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     char len_str[16];
     snprintf(len_str, sizeof(len_str), "%u", (unsigned)jpeg_size);
     httpd_resp_set_hdr(req, "Content-Length", len_str);
-    httpd_resp_send(req, (const char*)jpeg_data, jpeg_size);
+    httpd_resp_send(req, (const char*)jpeg_copy, jpeg_size);
+    heap_caps_free(jpeg_copy);
     return ESP_OK;
 }
 
@@ -762,9 +775,10 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
         "\r\n";
     ret = send(fd, response_headers, strlen(response_headers), 0);
     ESP_LOGI(TAG, "Stream: headers sent, ret=%d (expected %d)", (int)ret, (int)strlen(response_headers));
-    if (ret < 0) {
-        ESP_LOGE(TAG, "Stream headers send failed, errno=%d", errno);
-        return ESP_FAIL;
+    if (ret < 0 || ret == 0) {
+        ESP_LOGE(TAG, "Stream headers send failed, errno=%d, ret=%d", errno, (int)ret);
+        // 必须 goto stream_end 恢复电源管理模式
+        goto stream_end;
     }
 
     // 设置发送超时 50ms（防止单次 send() 无限阻塞）
@@ -805,10 +819,13 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
 
         consecutive_failures = 0;
 
+        // 在锁保护下复制帧数据，防止与拍照并发冲突
+        camera->LockFrame();
         const uint8_t* jpeg_data = camera->GetFrameData();
         size_t jpeg_size = camera->GetFrameSize();
 
         if (!jpeg_data || jpeg_size == 0) {
+            camera->UnlockFrame();
             ESP_LOGW(TAG, "Stream: frame has no data or size=0 after CaptureStreamFrame success");
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -822,14 +839,16 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
         size_t total_len = hdr_len + jpeg_size;
 
         if (total_len > tx_buf_size) {
+            camera->UnlockFrame();
             ESP_LOGW(TAG, "Stream: frame too large (%u > %u), dropping", (unsigned)total_len, (unsigned)tx_buf_size);
             frames_dropped++;
             continue;
         }
 
-        // 一次性拷贝到 TX 缓冲
+        // 在锁保护下拷贝到 TX 缓冲，拷贝完即可释放
         memcpy(tx_buf, hdr, hdr_len);
         memcpy(tx_buf + hdr_len, jpeg_data, jpeg_size);
+        camera->UnlockFrame();
 
         // 发送完整帧（send 有 50ms 超时保护，不会无限阻塞）
         size_t sent_total = 0;
@@ -841,7 +860,17 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
                     frames_dropped++;
                     goto next_frame;
                 }
+                // EPIPE：客户端已断开连接（TCP RST），或连接被对端关闭
+                if (errno == EPIPE || errno == ECONNRESET) {
+                    ESP_LOGI(TAG, "Stream: client disconnected, errno=%d", errno);
+                    goto stream_end;
+                }
                 ESP_LOGW(TAG, "Stream: send failed fd=%d, errno=%d", fd, errno);
+                goto stream_end;
+            }
+            if (sent == 0) {
+                // 客户端半关闭或 socket 状态异常，继续循环会导致死锁
+                ESP_LOGW(TAG, "Stream: send returned 0, client likely half-closed");
                 goto stream_end;
             }
             sent_total += sent;
@@ -1270,7 +1299,7 @@ const char* WebServer::get_html_page() {
                 }
                 return;
             }
-            if (dir === currentDirection && speed === currentSpeed) return;
+            // 后端有 dedup，前端不拦截（否则按住不动时后端收不到心跳）
             if (isRequestPending) return;
             currentDirection = dir; currentSpeed = speed;
             isRequestPending = true;

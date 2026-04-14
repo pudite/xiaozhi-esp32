@@ -367,6 +367,10 @@ Esp32Camera::Esp32Camera(const esp_video_init_config_t& config) {
 }
 
 Esp32Camera::~Esp32Camera() {
+    // 等待编码线程完成，避免析构时线程仍在运行导致 crash
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
     if (streaming_on_ && video_fd_ >= 0) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(video_fd_, VIDIOC_STREAMOFF, &type);
@@ -403,6 +407,8 @@ bool Esp32Camera::Capture() {
         return false;
     }
 
+    // Capture() 在 VIDIOC_DQBUF 之后才加锁，只保护 frame_ 的读写
+    // 避免 VIDIOC_DQBUF 在锁内阻塞导致与 CaptureStreamFrame() 死锁
     for (int i = 0; i < 3; i++) {
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -412,8 +418,9 @@ bool Esp32Camera::Capture() {
             return false;
         }
         if (i == 2) {
-            // 保存帧副本到PSRAM
+            // 保存帧副本到PSRAM（以下操作持锁保护 frame_）
             // 注意：不要释放 stream_buf_（流媒体缓冲区），它由 CaptureStreamFrame 管理
+            frame_mutex_.lock();
             if (frame_.data && frame_.data != stream_buf_) {
                 heap_caps_free(frame_.data);
             }
@@ -451,6 +458,7 @@ bool Esp32Camera::Capture() {
                         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                             ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                         }
+                        frame_mutex_.unlock();
                         return false;
                     }
                     ESP_LOGD(TAG, "JPEG format: found EOI at %lu bytes", frame_.len);
@@ -461,6 +469,7 @@ bool Esp32Camera::Capture() {
                     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                         ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                     }
+                    frame_mutex_.unlock();
                     return false;
                 }
             }
@@ -470,6 +479,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -542,6 +552,7 @@ bool Esp32Camera::Capture() {
                     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                         ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                     }
+                    frame_mutex_.unlock();
                     return false;
             }
 
@@ -554,6 +565,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
             uint8_t* rotate_src = (uint8_t*)frame_.data;
@@ -584,6 +596,7 @@ bool Esp32Camera::Capture() {
                     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                         ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                     }
+                    frame_mutex_.unlock();
                     return false;
             }
             esp_imgfx_rotate_handle_t rotate_handle = nullptr;
@@ -593,6 +606,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -615,6 +629,7 @@ bool Esp32Camera::Capture() {
                 }
                 esp_imgfx_rotate_close(rotate_handle);
                 rotate_handle = nullptr;
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -647,6 +662,7 @@ bool Esp32Camera::Capture() {
                         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                             ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                         }
+                        frame_mutex_.unlock();
                         return false;
                     }
                     esp_imgfx_color_convert_cfg_t convert_cfg = {
@@ -664,6 +680,7 @@ bool Esp32Camera::Capture() {
                         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                             ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                         }
+                        frame_mutex_.unlock();
                         return false;
                     }
                     esp_imgfx_data_t convert_input_data = {
@@ -684,6 +701,7 @@ bool Esp32Camera::Capture() {
                         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                             ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                         }
+                        frame_mutex_.unlock();
                         return false;
                     }
                     esp_imgfx_color_convert_close(convert_handle);
@@ -699,6 +717,7 @@ bool Esp32Camera::Capture() {
                     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                         ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                     }
+                    frame_mutex_.unlock();
                     return false;
             }
 
@@ -709,6 +728,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -725,6 +745,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -764,6 +785,7 @@ bool Esp32Camera::Capture() {
                 if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
+                frame_mutex_.unlock();
                 return false;
             }
 
@@ -776,6 +798,7 @@ bool Esp32Camera::Capture() {
             rotate_src = nullptr;
 #endif  // CONFIG_SOC_PPA_SUPPORTED
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+            frame_mutex_.unlock();
         }
 
         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
@@ -991,30 +1014,34 @@ bool Esp32Camera::CaptureStreamFrame() {
     }
 
     // 预分配足够大的缓冲区，避免每次 malloc/free
-    if (stream_buf_ == nullptr || stream_buf_size_ < jpeg_size) {
-        if (stream_buf_) {
-            heap_caps_free(stream_buf_);
-            stream_buf_ = nullptr;
-            stream_buf_size_ = 0;
-        }
-        stream_buf_size_ = jpeg_size;
-        stream_buf_ = (uint8_t*)heap_caps_malloc(stream_buf_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!stream_buf_) {
-            ESP_LOGE(TAG, "CSF: alloc %u bytes failed", (unsigned)stream_buf_size_);
-            stream_buf_size_ = 0;
-            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+    // 加锁保护 stream_buf_ 和 frame_ 的多线程访问
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        if (stream_buf_ == nullptr || stream_buf_size_ < jpeg_size) {
+            if (stream_buf_) {
+                heap_caps_free(stream_buf_);
+                stream_buf_ = nullptr;
+                stream_buf_size_ = 0;
             }
-            return false;
+            stream_buf_size_ = jpeg_size;
+            stream_buf_ = (uint8_t*)heap_caps_malloc(stream_buf_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!stream_buf_) {
+                ESP_LOGE(TAG, "CSF: alloc %u bytes failed", (unsigned)stream_buf_size_);
+                stream_buf_size_ = 0;
+                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                    ESP_LOGE(TAG, "CSF: VIDIOC_QBUF failed");
+                }
+                return false;
+            }
+            ESP_LOGI(TAG, "CSF: stream_buf allocated %u bytes", (unsigned)stream_buf_size_);
         }
-        ESP_LOGI(TAG, "CSF: stream_buf allocated %u bytes", (unsigned)stream_buf_size_);
-    }
 
-    // 从 mmap 缓冲区复制数据
-    memcpy(stream_buf_, mmap_buffers_[buf.index].start, jpeg_size);
-    frame_.data = stream_buf_;
-    frame_.len = jpeg_size;
-    frame_.format = sensor_format_;
+        // 从 mmap 缓冲区复制数据
+        memcpy(stream_buf_, mmap_buffers_[buf.index].start, jpeg_size);
+        frame_.data = stream_buf_;
+        frame_.len = jpeg_size;
+        frame_.format = sensor_format_;
+    }
 
     // 重新入队缓冲区
     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
@@ -1119,13 +1146,33 @@ std::string Esp32Camera::Explain(const std::string& question) {
         throw std::runtime_error("Failed to create JPEG queue");
     }
 
+    // 在锁保护下快照帧数据，避免与 CaptureStreamFrame() 并发冲突
+    uint8_t* snapshot_data = nullptr;
+    size_t snapshot_len = 0;
+    uint16_t snapshot_width = 0;
+    uint16_t snapshot_height = 0;
+    v4l2_pix_fmt_t snapshot_format = 0;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        snapshot_data = frame_.data;
+        snapshot_len = frame_.len;
+        snapshot_width = frame_.width;
+        snapshot_height = frame_.height;
+        snapshot_format = frame_.format;
+    }
+    if (!snapshot_data || snapshot_len == 0) {
+        ESP_LOGE(TAG, "Explain: no frame data available");
+        vQueueDelete(jpeg_queue);
+        throw std::runtime_error("No frame data available for explain");
+    }
+
     // We spawn a thread to encode the image to JPEG using optimized encoder (cost about 500ms and 8KB SRAM)
-    encoder_thread_ = std::thread([this, jpeg_queue]() {
-        uint16_t w = frame_.width ? frame_.width : 320;
-        uint16_t h = frame_.height ? frame_.height : 240;
-        v4l2_pix_fmt_t enc_fmt = frame_.format;
+    encoder_thread_ = std::thread([this, jpeg_queue, snapshot_data, snapshot_len,
+                                   snapshot_width, snapshot_height, snapshot_format]() {
+        uint16_t w = snapshot_width ? snapshot_width : 320;
+        uint16_t h = snapshot_height ? snapshot_height : 240;
         bool ok = image_to_jpeg_cb(
-            frame_.data, frame_.len, w, h, enc_fmt, 80,
+            snapshot_data, snapshot_len, w, h, snapshot_format, 80,
             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
                 auto jpeg_queue = static_cast<QueueHandle_t>(arg);
                 JpegChunk chunk = {.data = nullptr, .len = len};
@@ -1246,6 +1293,6 @@ std::string Esp32Camera::Explain(const std::string& question) {
     // Get remain task stack size
     size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(TAG, "Explain image size=%d bytes, compressed size=%d, remain stack size=%d, question=%s\n%s",
-             (int)frame_.len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+             (int)snapshot_len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
     return result;
 }
