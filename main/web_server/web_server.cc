@@ -740,6 +740,7 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
     ssize_t ret = 0;
     size_t tx_buf_size = 64 * 1024;
     uint8_t* tx_buf = nullptr;
+    int nodelay = 1;
     int consecutive_failures = 0;
     const int max_consecutive_failures = 10;
     int frames_sent = 0;
@@ -783,6 +784,10 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
 
     // 设置发送超时 50ms（防止单次 send() 无限阻塞）
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    // 禁用 Nagle 算法，立即发送 TCP 数据，降低 MJPEG 帧传输延迟
+    // LwIP 已实现 tcp_nagle_disable()，不分配额外内存
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     // 分配 TX 缓冲区
     tx_buf = (uint8_t*)heap_caps_malloc(tx_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -877,7 +882,7 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
         }
 
         frames_sent++;
-        if (frames_sent % 50 == 1) {
+        if (frames_sent % 200 == 1) {
             ESP_LOGI(TAG, "Stream: %d frames sent, %d dropped", frames_sent, frames_dropped);
         }
 
@@ -1396,7 +1401,7 @@ const char* WebServer::get_html_page() {
         setInterval(() => { if (isDragging) sendControl(currentDirection, currentSpeed); }, 200);
         window.addEventListener('resize', initJoystick);
 
-        // 视频流控制 - 使用 MJPEG 长连接，服务端限帧 10fps
+        // 视频流控制 - 使用 MJPEG 长连接
         let maxStreamRetries = 1; // 首次连接失败后仅重试1次
         function startStream() {
             if (streamState !== 'idle') return;

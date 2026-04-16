@@ -418,50 +418,44 @@ bool Esp32Camera::Capture() {
             return false;
         }
         if (i == 2) {
-            // 保存帧副本到PSRAM（以下操作持锁保护 frame_）
-            // 注意：不要释放 stream_buf_（流媒体缓冲区），它由 CaptureStreamFrame 管理
-            frame_mutex_.lock();
-            if (frame_.data && frame_.data != stream_buf_) {
-                heap_caps_free(frame_.data);
-            }
-            frame_.data = nullptr;
-            frame_.format = 0;
-            frame_.len = buf.bytesused;
+            // 搜索 EOI 确定帧大小（仅扫描 mmap 缓冲区，很快，不需要持锁）
+            size_t frame_len = buf.bytesused;
+            const int buf_index = buf.index;
             // 对于JPEG格式，某些驱动不报告bytesused（值为0），需要手动搜索EOI标记确定实际大小
-            if (frame_.len == 0) {
+            if (frame_len == 0) {
 #ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
                 if (sensor_format_ == V4L2_PIX_FMT_JPEG) {
-                    uint8_t* buf_start = (uint8_t*)mmap_buffers_[buf.index].start;
-                    size_t buf_len = mmap_buffers_[buf.index].length;
+                    uint8_t* buf_start = (uint8_t*)mmap_buffers_[buf_index].start;
+                    size_t buf_len = mmap_buffers_[buf_index].length;
 
                     if (buf_start[0] == 0xFF && buf_start[1] == 0xD8) {
+                        // 前向搜索 EOI (0xFF 0xD9)：用 memchr 加速 0xFF 定位
                         const size_t MAX_JPEG_SIZE = 100000;
-                        size_t search_end = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
-                        size_t pos = search_end - 2;
+                        size_t search_limit = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
+                        size_t pos = 2;
 
-                        while (pos > 0) {
-                            if (buf_start[pos] == 0xFF) {
-                                if (buf_start[pos + 1] == 0x00) {
-                                    pos -= 2;  // 跳过 byte-stuffed 0xFF
-                                    continue;
-                                }
-                                if (buf_start[pos + 1] == 0xD9) {
-                                    frame_.len = pos + 2;
-                                    break;
-                                }
+                        while (pos < search_limit - 1) {
+                            uint8_t* ff_pos = (uint8_t*)memchr(buf_start + pos, 0xFF, search_limit - 1 - pos);
+                            if (!ff_pos) break;
+                            pos = ff_pos - buf_start;
+                            if (buf_start[pos + 1] == 0x00) {
+                                pos += 2;  // 跳过 byte-stuffed 0xFF
+                                continue;
                             }
-                            pos--;
+                            if (buf_start[pos + 1] == 0xD9) {
+                                frame_len = pos + 2;
+                                break;
+                            }
+                            pos++;
                         }
                     }
-                    if (frame_.len == 0) {
+                    if (frame_len == 0) {
                         ESP_LOGE(TAG, "JPEG format: no valid EOI found, buf_len=%lu", buf_len);
                         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                             ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                         }
-                        frame_mutex_.unlock();
                         return false;
                     }
-                    ESP_LOGD(TAG, "JPEG format: found EOI at %lu bytes", frame_.len);
                 } else
 #endif
                 {
@@ -469,29 +463,57 @@ bool Esp32Camera::Capture() {
                     if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                         ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                     }
-                    frame_mutex_.unlock();
                     return false;
                 }
             }
-            frame_.data = (uint8_t*)heap_caps_malloc(frame_.len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!frame_.data) {
-                ESP_LOGE(TAG, "alloc frame copy failed: need allocate %lu bytes", buf.bytesused);
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+
+            // 交换旧帧指针并清空（持锁 < 0.01ms）
+            uint8_t* old_data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                if (frame_.data && frame_.data != stream_buf_) {
+                    old_data = frame_.data;
                 }
-                frame_mutex_.unlock();
+                frame_.data = nullptr;
+                frame_.format = 0;
+            }
+            if (old_data) {
+                heap_caps_free(old_data);
+            }
+
+            // QBUF 尽快归还缓冲区给驱动（减少 DQBUF→QBUF 间隔，降低对 CaptureStreamFrame 的影响）
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "VIDIOC_QBUF failed");
+            }
+
+            // 以下操作不在任何锁内执行，不会阻塞 CaptureStreamFrame()
+#ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+            ESP_LOGW(TAG, "mmap_buffers_[%d].length = %d, sensor_width = %d, sensor_height = %d",
+                     buf_index, (int)mmap_buffers_[buf_index].length, sensor_width_, sensor_height_);
+#else
+            ESP_LOGW(TAG, "mmap_buffers_[%d].length = %d, frame.width = %d, frame.height = %d",
+                     buf_index, (int)mmap_buffers_[buf_index].length, frame_.width, frame_.height);
+#endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf_index].start, MIN(mmap_buffers_[buf_index].length, 256),
+                                   ESP_LOG_DEBUG);
+
+            // 分配并复制帧数据（PSRAM 分配可能耗时 1-3ms，在锁外执行）
+            uint8_t* new_data = (uint8_t*)heap_caps_malloc(frame_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!new_data) {
+                ESP_LOGE(TAG, "alloc frame copy failed: need allocate %zu bytes", frame_len);
                 return false;
             }
 
-#ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
-                     mmap_buffers_[buf.index].length, sensor_width_, sensor_height_);
-#else
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
-                     mmap_buffers_[buf.index].length, frame_.width, frame_.height);
-#endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 256),
-                                   ESP_LOG_DEBUG);
+            memcpy(new_data, mmap_buffers_[buf_index].start,
+                   MIN(mmap_buffers_[buf_index].length, frame_len));
+
+            // 快速更新 frame_ 指针（持锁 < 0.01ms）
+            {
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                frame_.data = new_data;
+                frame_.len = frame_len;
+                frame_.format = sensor_format_;
+            }
 
             switch (sensor_format_) {
                 case V4L2_PIX_FMT_RGB565:
@@ -504,16 +526,19 @@ bool Esp32Camera::Capture() {
 #endif  // CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
 #ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                 {
-                    auto src16 = (uint16_t*)mmap_buffers_[buf.index].start;
+                    auto src16 = (uint16_t*)mmap_buffers_[buf_index].start;
                     auto dst16 = (uint16_t*)frame_.data;
-                    size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
+                    size_t count = (size_t)mmap_buffers_[buf_index].length / 2;
                     for (size_t i = 0; i < count; i++) {
                         dst16[i] = __builtin_bswap16(src16[i]);
                     }
                 }
 #else
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
+                    // JPEG 格式已在上面完成 memcpy，非 JPEG 格式需要在此复制
+                    if (sensor_format_ != V4L2_PIX_FMT_JPEG) {
+                        memcpy(frame_.data, mmap_buffers_[buf_index].start,
+                               MIN(mmap_buffers_[buf_index].length, frame_.len));
+                    }
 #endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                     frame_.format = sensor_format_;
                     break;
@@ -522,23 +547,23 @@ bool Esp32Camera::Capture() {
                     frame_.format = V4L2_PIX_FMT_YUYV;
 #ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                     {
-                        auto src16 = (uint16_t*)mmap_buffers_[buf.index].start;
+                        auto src16 = (uint16_t*)mmap_buffers_[buf_index].start;
                         auto dst16 = (uint16_t*)frame_.data;
-                        size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
+                        size_t count = (size_t)mmap_buffers_[buf_index].length / 2;
                         for (size_t i = 0; i < count; i++) {
                             dst16[i] = __builtin_bswap16(src16[i]);
                         }
                     }
 #else
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
+                    memcpy(frame_.data, mmap_buffers_[buf_index].start,
+                           MIN(mmap_buffers_[buf_index].length, frame_.len));
 #endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                     break;
                 }
                 case V4L2_PIX_FMT_RGB565X: {
                     // 大端序的 RGB565 需要转换为小端序
                     // 目前 esp_video 的大小端都会返回格式为 RGB565，不会返回格式为 RGB565X，此 case 用于未来版本兼容
-                    auto src16 = (uint16_t*)mmap_buffers_[buf.index].start;
+                    auto src16 = (uint16_t*)mmap_buffers_[buf_index].start;
                     auto dst16 = (uint16_t*)frame_.data;
                     size_t pixel_count = (size_t)frame_.width * (size_t)frame_.height;
                     for (size_t i = 0; i < pixel_count; i++) {
@@ -549,260 +574,264 @@ bool Esp32Camera::Capture() {
                 }
                 default:
                     ESP_LOGE(TAG, "unsupported sensor format: 0x%08lx", sensor_format_);
-                    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                        ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                    }
-                    frame_mutex_.unlock();
+                    heap_caps_free(new_data);
                     return false;
             }
 
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
 #ifndef CONFIG_SOC_PPA_SUPPORTED
-            uint8_t* rotate_dst =
-                (uint8_t*)heap_caps_aligned_alloc(64, frame_.len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (rotate_dst == nullptr) {
-                ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                }
-                frame_mutex_.unlock();
-                return false;
-            }
-            uint8_t* rotate_src = (uint8_t*)frame_.data;
-
-            esp_imgfx_rotate_cfg_t rotate_cfg = {
-                .in_res =
-                    {
-                        .width = static_cast<int16_t>(sensor_width_),
-                        .height = static_cast<int16_t>(sensor_height_),
-                    },
-                .degree = IMAGE_ROTATION_ANGLE,
-            };
-            switch (frame_.format) {
-                case V4L2_PIX_FMT_RGB565:
-                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
-                    break;
-                case V4L2_PIX_FMT_YUYV:
-                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
-                    break;
-                case V4L2_PIX_FMT_GREY:
-                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_Y;
-                    break;
-                case V4L2_PIX_FMT_RGB24:
-                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB888;
-                    break;
-                default:
-                    ESP_LOGE(TAG, "unsupported sensor format: 0x%08lx", sensor_format_);
-                    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                        ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                    }
-                    frame_mutex_.unlock();
+            {
+                uint8_t* rotate_dst =
+                    (uint8_t*)heap_caps_aligned_alloc(64, frame_.len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (rotate_dst == nullptr) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
                     return false;
-            }
-            esp_imgfx_rotate_handle_t rotate_handle = nullptr;
-            esp_imgfx_err_t imgfx_err = esp_imgfx_rotate_open(&rotate_cfg, &rotate_handle);
-            if (imgfx_err != ESP_IMGFX_ERR_OK || rotate_handle == nullptr) {
-                ESP_LOGE(TAG, "esp_imgfx_rotate_create failed");
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
-                frame_mutex_.unlock();
-                return false;
-            }
+                uint8_t* rotate_src = new_data;
 
-            esp_imgfx_data_t rotate_input_data = {
-                .data = rotate_src,
-                .data_len = frame_.len,
-            };
-            esp_imgfx_data_t rotate_output_data = {
-                .data = rotate_dst,
-                .data_len = frame_.len,
-            };
-
-            imgfx_err = esp_imgfx_rotate_process(rotate_handle, &rotate_input_data, &rotate_output_data);
-            if (imgfx_err != ESP_IMGFX_ERR_OK) {
-                ESP_LOGE(TAG, "esp_imgfx_rotate_process failed");
-                heap_caps_free(rotate_dst);
-                rotate_dst = nullptr;
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                esp_imgfx_rotate_cfg_t rotate_cfg = {
+                    .in_res =
+                        {
+                            .width = static_cast<int16_t>(sensor_width_),
+                            .height = static_cast<int16_t>(sensor_height_),
+                        },
+                    .degree = IMAGE_ROTATION_ANGLE,
+                };
+                switch (frame_.format) {
+                    case V4L2_PIX_FMT_RGB565:
+                        rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
+                        break;
+                    case V4L2_PIX_FMT_YUYV:
+                        rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
+                        break;
+                    case V4L2_PIX_FMT_GREY:
+                        rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_Y;
+                        break;
+                    case V4L2_PIX_FMT_RGB24:
+                        rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB888;
+                        break;
+                    default:
+                        ESP_LOGE(TAG, "unsupported sensor format: 0x%08lx", sensor_format_);
+                        heap_caps_free(rotate_dst);
+                        std::lock_guard<std::mutex> lock(frame_mutex_);
+                        frame_.data = nullptr;
+                        frame_.len = 0;
+                        return false;
                 }
+                esp_imgfx_rotate_handle_t rotate_handle = nullptr;
+                esp_imgfx_err_t imgfx_err = esp_imgfx_rotate_open(&rotate_cfg, &rotate_handle);
+                if (imgfx_err != ESP_IMGFX_ERR_OK || rotate_handle == nullptr) {
+                    ESP_LOGE(TAG, "esp_imgfx_rotate_create failed");
+                    heap_caps_free(rotate_dst);
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
+                    return false;
+                }
+
+                esp_imgfx_data_t rotate_input_data = {
+                    .data = rotate_src,
+                    .data_len = frame_.len,
+                };
+                esp_imgfx_data_t rotate_output_data = {
+                    .data = rotate_dst,
+                    .data_len = frame_.len,
+                };
+
+                imgfx_err = esp_imgfx_rotate_process(rotate_handle, &rotate_input_data, &rotate_output_data);
+                if (imgfx_err != ESP_IMGFX_ERR_OK) {
+                    ESP_LOGE(TAG, "esp_imgfx_rotate_process failed");
+                    heap_caps_free(rotate_dst);
+                    esp_imgfx_rotate_close(rotate_handle);
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
+                    return false;
+                }
+
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                frame_.data = rotate_dst;
+
+                heap_caps_free(rotate_src);
+                rotate_src = nullptr;
+
                 esp_imgfx_rotate_close(rotate_handle);
                 rotate_handle = nullptr;
-                frame_mutex_.unlock();
-                return false;
             }
-
-            frame_.data = rotate_dst;
-
-            heap_caps_free(rotate_src);
-            rotate_src = nullptr;
-
-            esp_imgfx_rotate_close(rotate_handle);
-            rotate_handle = nullptr;
 #else   // CONFIG_SOC_PPA_SUPPORTED
-            uint8_t* rotate_src = nullptr;
+            {
+                uint8_t* rotate_src = nullptr;
 
-            ppa_srm_color_mode_t ppa_color_mode;
-            switch (frame_.format) {
-                case V4L2_PIX_FMT_RGB565:
-                    rotate_src = (uint8_t*)frame_.data;
-                    ppa_color_mode = PPA_SRM_COLOR_MODE_RGB565;
-                    break;
-                case V4L2_PIX_FMT_RGB24:
-                    rotate_src = (uint8_t*)frame_.data;
-                    ppa_color_mode = PPA_SRM_COLOR_MODE_RGB888;
-                    break;
-                case V4L2_PIX_FMT_YUYV: {
-                    ESP_LOGW(TAG, "YUYV format is not supported for PPA rotation, using software conversion to RGB888");
-                    rotate_src = (uint8_t*)heap_caps_malloc(frame_.width * frame_.height * 3,
-                                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    if (rotate_src == nullptr) {
-                        ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
-                        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                            ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                ppa_srm_color_mode_t ppa_color_mode;
+                v4l2_pix_fmt_t current_format;
+                uint16_t current_width, current_height;
+                size_t current_len;
+                {
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    current_format = frame_.format;
+                    current_width = frame_.width;
+                    current_height = frame_.height;
+                    current_len = frame_.len;
+                }
+                switch (current_format) {
+                    case V4L2_PIX_FMT_RGB565:
+                        rotate_src = new_data;
+                        ppa_color_mode = PPA_SRM_COLOR_MODE_RGB565;
+                        break;
+                    case V4L2_PIX_FMT_RGB24:
+                        rotate_src = new_data;
+                        ppa_color_mode = PPA_SRM_COLOR_MODE_RGB888;
+                        break;
+                    case V4L2_PIX_FMT_YUYV: {
+                        ESP_LOGW(TAG, "YUYV format is not supported for PPA rotation, using software conversion to RGB888");
+                        rotate_src = (uint8_t*)heap_caps_malloc(current_width * current_height * 3,
+                                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                        if (rotate_src == nullptr) {
+                            ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
+                            std::lock_guard<std::mutex> lock(frame_mutex_);
+                            frame_.data = nullptr;
+                            frame_.len = 0;
+                            return false;
                         }
-                        frame_mutex_.unlock();
-                        return false;
-                    }
-                    esp_imgfx_color_convert_cfg_t convert_cfg = {
-                        .in_res = {.width = static_cast<int16_t>(frame_.width),
-                                   .height = static_cast<int16_t>(frame_.height)},
-                        .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_YUYV,
-                        .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB888,
-                    };
-                    esp_imgfx_color_convert_handle_t convert_handle = nullptr;
-                    esp_imgfx_err_t err = esp_imgfx_color_convert_open(&convert_cfg, &convert_handle);
-                    if (err != ESP_IMGFX_ERR_OK || convert_handle == nullptr) {
-                        ESP_LOGE(TAG, "esp_imgfx_color_convert_open failed");
-                        heap_caps_free(rotate_src);
-                        rotate_src = nullptr;
-                        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                            ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                        esp_imgfx_color_convert_cfg_t convert_cfg = {
+                            .in_res = {.width = static_cast<int16_t>(current_width),
+                                       .height = static_cast<int16_t>(current_height)},
+                            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_YUYV,
+                            .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB888,
+                        };
+                        esp_imgfx_color_convert_handle_t convert_handle = nullptr;
+                        esp_imgfx_err_t err = esp_imgfx_color_convert_open(&convert_cfg, &convert_handle);
+                        if (err != ESP_IMGFX_ERR_OK || convert_handle == nullptr) {
+                            ESP_LOGE(TAG, "esp_imgfx_color_convert_open failed");
+                            heap_caps_free(rotate_src);
+                            rotate_src = nullptr;
+                            std::lock_guard<std::mutex> lock(frame_mutex_);
+                            frame_.data = nullptr;
+                            frame_.len = 0;
+                            return false;
                         }
-                        frame_mutex_.unlock();
-                        return false;
-                    }
-                    esp_imgfx_data_t convert_input_data = {
-                        .data = frame_.data,
-                        .data_len = frame_.len,
-                    };
-                    esp_imgfx_data_t convert_output_data = {
-                        .data = rotate_src,
-                        .data_len = static_cast<uint32_t>(frame_.width * frame_.height * 3),
-                    };
-                    err = esp_imgfx_color_convert_process(convert_handle, &convert_input_data, &convert_output_data);
-                    if (err != ESP_IMGFX_ERR_OK) {
-                        ESP_LOGE(TAG, "esp_imgfx_color_convert_process failed");
-                        heap_caps_free(rotate_src);
-                        rotate_src = nullptr;
+                        esp_imgfx_data_t convert_input_data = {
+                            .data = new_data,
+                            .data_len = current_len,
+                        };
+                        esp_imgfx_data_t convert_output_data = {
+                            .data = rotate_src,
+                            .data_len = static_cast<uint32_t>(current_width * current_height * 3),
+                        };
+                        err = esp_imgfx_color_convert_process(convert_handle, &convert_input_data, &convert_output_data);
+                        if (err != ESP_IMGFX_ERR_OK) {
+                            ESP_LOGE(TAG, "esp_imgfx_color_convert_process failed");
+                            heap_caps_free(rotate_src);
+                            rotate_src = nullptr;
+                            esp_imgfx_color_convert_close(convert_handle);
+                            convert_handle = nullptr;
+                            std::lock_guard<std::mutex> lock(frame_mutex_);
+                            frame_.data = nullptr;
+                            frame_.len = 0;
+                            return false;
+                        }
                         esp_imgfx_color_convert_close(convert_handle);
                         convert_handle = nullptr;
-                        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                            ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                        }
-                        frame_mutex_.unlock();
+                        ppa_color_mode = PPA_SRM_COLOR_MODE_RGB888;
+                        heap_caps_free(new_data);
+                        frame_.len = current_width * current_height * 3;
+                        break;
+                    }
+                    default:
+                        ESP_LOGE(TAG, "unsupported sensor format for PPA rotation: 0x%08lx", sensor_format_);
+                        std::lock_guard<std::mutex> lock(frame_mutex_);
+                        frame_.data = nullptr;
+                        frame_.len = 0;
                         return false;
-                    }
-                    esp_imgfx_color_convert_close(convert_handle);
-                    convert_handle = nullptr;
-                    ppa_color_mode = PPA_SRM_COLOR_MODE_RGB888;
-                    heap_caps_free(frame_.data);
-                    frame_.data = rotate_src;
-                    frame_.len = frame_.width * frame_.height * 3;
-                    break;
                 }
-                default:
-                    ESP_LOGE(TAG, "unsupported sensor format for PPA rotation: 0x%08lx", sensor_format_);
-                    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                        ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                    }
-                    frame_mutex_.unlock();
+
+                uint8_t* rotate_dst = (uint8_t*)heap_caps_malloc(
+                    current_width * current_height * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_CACHE_ALIGNED);
+                if (rotate_dst == nullptr) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
+                    heap_caps_free(rotate_src);
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
                     return false;
-            }
-
-            uint8_t* rotate_dst = (uint8_t*)heap_caps_malloc(
-                frame_.width * frame_.height * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_CACHE_ALIGNED);
-            if (rotate_dst == nullptr) {
-                ESP_LOGE(TAG, "Failed to allocate memory for rotate image");
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
                 }
-                frame_mutex_.unlock();
-                return false;
-            }
 
-            ppa_client_handle_t ppa_client = nullptr;
-            ppa_client_config_t client_cfg = {
-                .oper_type = PPA_OPERATION_SRM,
-                .max_pending_trans_num = 1,
-            };
-            esp_err_t err = ppa_register_client(&client_cfg, &ppa_client);
-            if (err != ESP_OK || ppa_client == nullptr) {
-                ESP_LOGE(TAG, "ppa_register_client failed: %d", (int)err);
-                heap_caps_free(rotate_dst);
-                rotate_dst = nullptr;
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
+                ppa_client_handle_t ppa_client = nullptr;
+                ppa_client_config_t client_cfg = {
+                    .oper_type = PPA_OPERATION_SRM,
+                    .max_pending_trans_num = 1,
+                };
+                esp_err_t err = ppa_register_client(&client_cfg, &ppa_client);
+                if (err != ESP_OK || ppa_client == nullptr) {
+                    ESP_LOGE(TAG, "ppa_register_client failed: %d", (int)err);
+                    heap_caps_free(rotate_dst);
+                    heap_caps_free(rotate_src);
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
+                    return false;
                 }
-                frame_mutex_.unlock();
-                return false;
-            }
 
-            ppa_srm_rotation_angle_t ppa_angle = IMAGE_ROTATION_ANGLE;
+                ppa_srm_rotation_angle_t ppa_angle = IMAGE_ROTATION_ANGLE;
 
-            ppa_srm_oper_config_t srm_cfg = {};
-            srm_cfg.in.buffer = (void*)rotate_src;
-            srm_cfg.in.pic_w = sensor_width_;
-            srm_cfg.in.pic_h = sensor_height_;
-            srm_cfg.in.block_w = sensor_width_;
-            srm_cfg.in.block_h = sensor_height_;
-            srm_cfg.in.block_offset_x = 0;
-            srm_cfg.in.block_offset_y = 0;
-            srm_cfg.in.srm_cm = ppa_color_mode;
+                ppa_srm_oper_config_t srm_cfg = {};
+                srm_cfg.in.buffer = (void*)rotate_src;
+                srm_cfg.in.pic_w = sensor_width_;
+                srm_cfg.in.pic_h = sensor_height_;
+                srm_cfg.in.block_w = sensor_width_;
+                srm_cfg.in.block_h = sensor_height_;
+                srm_cfg.in.block_offset_x = 0;
+                srm_cfg.in.block_offset_y = 0;
+                srm_cfg.in.srm_cm = ppa_color_mode;
 
-            srm_cfg.out.buffer = (void*)rotate_dst;
-            srm_cfg.out.buffer_size = frame_.len;
-            srm_cfg.out.pic_w = frame_.width;
-            srm_cfg.out.pic_h = frame_.height;
-            srm_cfg.out.block_offset_x = 0;
-            srm_cfg.out.block_offset_y = 0;
-            srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+                srm_cfg.out.buffer = (void*)rotate_dst;
+                srm_cfg.out.buffer_size = frame_.len;
+                srm_cfg.out.pic_w = frame_.width;
+                srm_cfg.out.pic_h = frame_.height;
+                srm_cfg.out.block_offset_x = 0;
+                srm_cfg.out.block_offset_y = 0;
+                srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-            // 等比例缩放 1.0
-            srm_cfg.scale_x = 1.0f;
-            srm_cfg.scale_y = 1.0f;
-            srm_cfg.rotation_angle = ppa_angle;
-            srm_cfg.mode = PPA_TRANS_MODE_BLOCKING;
-            srm_cfg.user_data = nullptr;
+                // 等比例缩放 1.0
+                srm_cfg.scale_x = 1.0f;
+                srm_cfg.scale_y = 1.0f;
+                srm_cfg.rotation_angle = ppa_angle;
+                srm_cfg.mode = PPA_TRANS_MODE_BLOCKING;
+                srm_cfg.user_data = nullptr;
 
-            err = ppa_do_scale_rotate_mirror(ppa_client, &srm_cfg);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "ppa_do_scale_rotate_mirror failed: %d", (int)err);
-                heap_caps_free(rotate_dst);
-                rotate_dst = nullptr;
+                err = ppa_do_scale_rotate_mirror(ppa_client, &srm_cfg);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "ppa_do_scale_rotate_mirror failed: %d", (int)err);
+                    heap_caps_free(rotate_dst);
+                    heap_caps_free(rotate_src);
+                    (void)ppa_unregister_client(ppa_client);
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
+                    return false;
+                }
+
                 (void)ppa_unregister_client(ppa_client);
-                if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-                    ESP_LOGE(TAG, "Cleanup: VIDIOC_QBUF failed");
-                }
-                frame_mutex_.unlock();
-                return false;
+
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                frame_.data = rotate_dst;
+                frame_.len = current_width * current_height * 2;
+                frame_.format = V4L2_PIX_FMT_RGB565;
+                heap_caps_free(rotate_src);
+                rotate_src = nullptr;
             }
-
-            (void)ppa_unregister_client(ppa_client);
-
-            frame_.data = rotate_dst;
-            frame_.len = frame_.width * frame_.height * 2;
-            frame_.format = V4L2_PIX_FMT_RGB565;
-            heap_caps_free(rotate_src);
-            rotate_src = nullptr;
 #endif  // CONFIG_SOC_PPA_SUPPORTED
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            frame_mutex_.unlock();
         }
 
-        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "VIDIOC_QBUF failed");
+        // 对于 i==2，buf 已在上面 QBUF 过了，跳过循环末尾的重复 QBUF
+        if (i != 2) {
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "VIDIOC_QBUF failed");
+            }
         }
     }
 
@@ -977,22 +1006,24 @@ bool Esp32Camera::CaptureStreamFrame() {
         size_t buf_len = mmap_buffers_[buf.index].length;
 
         if (buf_start[0] == 0xFF && buf_start[1] == 0xD8) {
+            // 前向搜索 EOI (0xFF 0xD9)：用 memchr 加速 0xFF 定位
             const size_t MAX_JPEG_SIZE = 100000;
-            size_t search_end = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
-            size_t pos = search_end - 2;
+            size_t search_limit = (buf_len < MAX_JPEG_SIZE) ? buf_len : MAX_JPEG_SIZE;
+            size_t pos = 2;
 
-            while (pos > 0) {
-                if (buf_start[pos] == 0xFF) {
-                    if (buf_start[pos + 1] == 0x00) {
-                        pos -= 2;  // 跳过 byte-stuffed 0xFF
-                        continue;
-                    }
-                    if (buf_start[pos + 1] == 0xD9) {
-                        jpeg_size = pos + 2;
-                        break;
-                    }
+            while (pos < search_limit - 1) {
+                uint8_t* ff_pos = (uint8_t*)memchr(buf_start + pos, 0xFF, search_limit - 1 - pos);
+                if (!ff_pos) break;
+                pos = ff_pos - buf_start;
+                if (buf_start[pos + 1] == 0x00) {
+                    pos += 2;  // 跳过 byte-stuffed 0xFF
+                    continue;
                 }
-                pos--;
+                if (buf_start[pos + 1] == 0xD9) {
+                    jpeg_size = pos + 2;
+                    break;
+                }
+                pos++;
             }
         }
         if (jpeg_size == 0) {
@@ -1014,16 +1045,23 @@ bool Esp32Camera::CaptureStreamFrame() {
     }
 
     // 预分配足够大的缓冲区，避免每次 malloc/free
-    // 加锁保护 stream_buf_ 和 frame_ 的多线程访问
+    // 分配时留 20% 余量，减少 JPEG 帧大小波动导致的反复 realloc
+    // 设定基于分辨率的最小初始大小，覆盖摄像头 AE/AWB 稳定期间的帧大小波动
     {
+        // 最小缓冲区 64KB，与 web_server TX buffer 策略一致，
+        // 覆盖启动阶段 AE/AWB 波动和高画质场景
+        constexpr size_t STREAM_BUF_MIN = 64 * 1024;
+
         std::lock_guard<std::mutex> lock(frame_mutex_);
-        if (stream_buf_ == nullptr || stream_buf_size_ < jpeg_size) {
+        size_t alloc_size = jpeg_size + (jpeg_size >> 2);  // +20% headroom
+        if (alloc_size < STREAM_BUF_MIN) alloc_size = STREAM_BUF_MIN;
+        if (stream_buf_ == nullptr || stream_buf_size_ < alloc_size) {
             if (stream_buf_) {
                 heap_caps_free(stream_buf_);
                 stream_buf_ = nullptr;
                 stream_buf_size_ = 0;
             }
-            stream_buf_size_ = jpeg_size;
+            stream_buf_size_ = alloc_size;
             stream_buf_ = (uint8_t*)heap_caps_malloc(stream_buf_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!stream_buf_) {
                 ESP_LOGE(TAG, "CSF: alloc %u bytes failed", (unsigned)stream_buf_size_);
@@ -1033,7 +1071,8 @@ bool Esp32Camera::CaptureStreamFrame() {
                 }
                 return false;
             }
-            ESP_LOGI(TAG, "CSF: stream_buf allocated %u bytes", (unsigned)stream_buf_size_);
+            ESP_LOGD(TAG, "CSF: stream_buf allocated %u bytes (headroom for %u)",
+                     (unsigned)stream_buf_size_, (unsigned)jpeg_size);
         }
 
         // 从 mmap 缓冲区复制数据

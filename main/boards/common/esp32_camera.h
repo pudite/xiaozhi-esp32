@@ -46,7 +46,7 @@ private:
     // 流媒体预分配缓冲区（避免每次 CaptureStreamFrame 都 malloc/free）
     uint8_t* stream_buf_ = nullptr;
     size_t stream_buf_size_ = 0;
-    // 保护 frame_ 和 stream_buf_ 的多线程访问（httpd 并发请求）
+    // 保护 frame_ 和 stream_buf_ 的多线程访问（httpd 并发请求、Explain 与 CaptureStreamFrame 并发）
     mutable std::mutex frame_mutex_;
 
 public:

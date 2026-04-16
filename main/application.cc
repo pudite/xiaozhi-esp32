@@ -366,14 +366,16 @@ void Application::Run() {
                 }
             }
 
-            // 电机安全看门狗：检测摇杆控制失联（前端断网/关页面）
-            // 使用 last_web_control_time_ms_（每次 HandleWebMotorControl 都更新，不受 dedup 影响）
-            if (realtime_control_active_.load() && last_web_control_time_ms_.load() > 0) {
+            // 电机安全看门狗：仅在网页摇杆控制激活时生效，
+            // 避免误触发语音反馈、情感动作、MCP命令等非WEB控制的电机动作
+            if (web_control_active_.load() && last_web_control_time_ms_.load() > 0) {
                 int64_t now_ms = esp_timer_get_time() / 1000;
                 int64_t elapsed_ms = now_ms - last_web_control_time_ms_.load();
                 if (elapsed_ms > WEB_CONTROL_WATCHDOG_MS) {
-                    ESP_LOGW(TAG, "Motor watchdog: no command for %lld ms, auto-stopping", (long long)elapsed_ms);
+                    ESP_LOGW(TAG, "Motor watchdog: no command for %ld ms, auto-stopping", (long)elapsed_ms);
                     StopRealtimeMotorControl();
+                    web_control_active_.store(false);
+                    UpdatePowerSaveLevel();
                 }
             }
 
@@ -2031,12 +2033,11 @@ void Application::SaveMotorActionConfig() {
 void Application::UpdatePowerSaveLevel() {
     std::lock_guard<std::mutex> lock(power_mutex_);
 
-    bool needs_performance = web_control_active_.load() || stream_active_.load();
+    bool web = web_control_active_.load();
+    bool stream = stream_active_.load();
+    bool audio = protocol_ && protocol_->IsAudioChannelOpened();
 
-    // 安全检查：protocol_可能为空
-    if (protocol_) {
-        needs_performance = needs_performance || protocol_->IsAudioChannelOpened();
-    }
+    bool needs_performance = web || stream || audio;
 
     PowerSaveLevel new_level = needs_performance ?
         PowerSaveLevel::PERFORMANCE : PowerSaveLevel::LOW_POWER;
@@ -2048,9 +2049,6 @@ void Application::UpdatePowerSaveLevel() {
 
         const char* trigger = "unknown";
         if (new_level == PowerSaveLevel::PERFORMANCE) {
-            bool web = web_control_active_.load();
-            bool stream = stream_active_.load();
-            bool audio = protocol_ && protocol_->IsAudioChannelOpened();
             if (web && audio) {
                 trigger = "web+audio";
             } else if (stream && audio) {
@@ -2069,6 +2067,23 @@ void Application::UpdatePowerSaveLevel() {
         ESP_LOGI(TAG, "Power save level changed to: %s (trigger: %s)",
                  new_level == PowerSaveLevel::PERFORMANCE ? "PERFORMANCE" : "LOW_POWER",
                  trigger);
+    } else if (new_level == PowerSaveLevel::PERFORMANCE) {
+        // 保持 PERFORMANCE 模式，记录维持原因（用于诊断流断开但语音仍在的情况）
+        const char* trigger = "unknown";
+        if (web && audio) {
+            trigger = "web+audio";
+        } else if (stream && audio) {
+            trigger = "stream+audio";
+        } else if (web && stream) {
+            trigger = "web+stream";
+        } else if (web) {
+            trigger = "web";
+        } else if (stream) {
+            trigger = "stream";
+        } else if (audio) {
+            trigger = "audio";
+        }
+        ESP_LOGD(TAG, "Power save maintained: PERFORMANCE (trigger: %s)", trigger);
     }
 }
 
