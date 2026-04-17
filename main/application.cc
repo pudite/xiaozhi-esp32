@@ -356,26 +356,13 @@ void Application::Run() {
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
 
-            // 检查WEB控制超时（每秒一次）
+            // 检查WEB控制超时（每秒一次）— 仅用于电源管理，不再用于看门狗
             if (web_control_active_.load()) {
                 int64_t now_ms = esp_timer_get_time() / 1000;
                 if ((now_ms - last_web_control_time_ms_.load()) > WEB_CONTROL_TIMEOUT_MS) {
                     web_control_active_.store(false);
                     UpdatePowerSaveLevel();
                     ESP_LOGI(TAG, "WEB control timeout, switching to low power mode");
-                }
-            }
-
-            // 电机安全看门狗：仅在网页摇杆控制激活时生效，
-            // 避免误触发语音反馈、情感动作、MCP命令等非WEB控制的电机动作
-            if (web_control_active_.load() && last_web_control_time_ms_.load() > 0) {
-                int64_t now_ms = esp_timer_get_time() / 1000;
-                int64_t elapsed_ms = now_ms - last_web_control_time_ms_.load();
-                if (elapsed_ms > WEB_CONTROL_WATCHDOG_MS) {
-                    ESP_LOGW(TAG, "Motor watchdog: no command for %ld ms, auto-stopping", (long)elapsed_ms);
-                    StopRealtimeMotorControl();
-                    web_control_active_.store(false);
-                    UpdatePowerSaveLevel();
                 }
             }
 
@@ -462,6 +449,11 @@ void Application::HandleActivationDoneEvent() {
     // Start web server for remote control
     web_server_->SetMotorControlCallback([this](int direction, int speed) {
         HandleWebMotorControl(direction, speed);
+    });
+
+    // WebSocket 断开时清理 web 控制状态
+    web_server_->SetWebControlStateClearCallback([this]() {
+        ClearWebControlState();
     });
 
     // Set emotion callback for web interface
@@ -1738,37 +1730,43 @@ void Application::HandleMotorActionWithDuration(int direction, int speed, int du
 }
 
 void Application::HandleWebMotorControl(int direction, int speed) {
-    ESP_LOGI(TAG, "Web motor control: direction=%d, speed=%d", direction, speed);
+    // 将网页控制转换为电机命令
+    // direction: 0=停止, 1=右, 2=下(后退), 3=左, 4=上(前进)
+    // speed: 0-100（5 档离散值：20/40/60/80/100）
+
+    // 避免重复发送相同的命令
+    if (direction == last_web_direction_ && speed == last_web_speed_) {
+        return;
+    }
+
+    last_web_direction_ = direction;
+    last_web_speed_ = speed;
+
+    // 速度为0时停止
+    if (speed == 0) {
+        StopRealtimeMotorControl();
+        // 松手后启动 30 秒超时计时器（不是清理 web_control_active_）
+        last_web_control_time_ms_.store(esp_timer_get_time() / 1000);
+        return;
+    }
+
+    // L298N + N20蜗杆减速电机启动阈值较高
+    // speed < 50 时提升到 50，确保电机能启动
+    if (speed < 50) {
+        speed = 50;
+    }
+
+    // 方向为0但速度>0：保持当前方向继续运行（不响应）
+    if (direction == 0) {
+        return;
+    }
 
     // 标记WEB控制活跃并更新时间戳
     web_control_active_.store(true);
     last_web_control_time_ms_.store(esp_timer_get_time() / 1000);
     UpdatePowerSaveLevel();
 
-    // 将网页控制转换为电机命令
-    // direction: 0=停止, 1=右, 2=下(后退), 3=左, 4=上(前进)
-    // speed: 0-100
-
-    static int last_direction = 0;
-    static int last_speed = 0;
-
-    // 避免重复发送相同的命令
-    if (direction == last_direction && speed == last_speed) {
-        return;
-    }
-
-    last_direction = direction;
-    last_speed = speed;
-
-    // 如果速度为0或方向为0，停止实时控制并停止电机
-    if (speed == 0 || direction == 0) {
-        StopRealtimeMotorControl();
-        return;
-    }
-
     // 根据方向和速度计算电机控制命令
-    // 我们使用现有的电机控制命令格式，但添加速度控制
-    // 直接实时控制电机（绕过队列）
     SetRealtimeMotorCommand(direction, speed);
 }
 
@@ -1808,49 +1806,51 @@ void Application::SetRealtimeMotorCommand(int direction, int speed) {
 
     if (motor_pwm_initialized_member_) {
         uint32_t max_duty = (1 << pwm_resolution_bits_) - 1;
-        uint32_t duty = (speed * max_duty) / 100;
 
-        // 使用 ledc fade 实现平滑过渡（模式 A：把目标通道设置为 PWM，其他通道为 0）
-        // 先把所有通道设为 0（平滑）
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
+        // Kick-start: boost first command from stop to break static friction
+        int effective_speed = speed;
+        int prev_duty = current_pwm_duty_.load();
+        if (prev_duty == 0 && speed > 0) {
+            effective_speed = speed > 85 ? speed : 85;
+        }
+        uint32_t duty = (effective_speed * max_duty) / 100;
+        current_pwm_duty_.store(effective_speed);
 
-        // 然后根据方向，把对应的通道设为目标占空比（平滑）
+        // 直接设置占空比（不使用 fade，避免 20ms 高频指令打断渐变导致电机无法启动）
+        // 先把所有通道设为 0
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0);
+
+        // 然后根据方向，把对应的通道设为目标占空比
         // 修正映射：根据测试结果，原映射逆时针旋转了90度，需要逆时针旋转90度修正
         switch (direction) {
             case 1: // 右转: LB (ch1) + RB (ch3) [原后退]
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty);
                 break;
             case 2: // 后退: LB (ch1) + RF (ch2) [原左转]
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty);
                 break;
             case 3: // 左转: LF (ch0) + RF (ch2) [原前进]
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty);
                 break;
             case 4: // 前进: LF (ch0) + RB (ch3) [原右转]
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
-                ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty, pwm_ramp_ms_);
-                ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty);
                 break;
             default:
                 break;
         }
+
+        // 更新硬件
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
     } else {
         // 回退到 GPIO 控制（如果 PWM 未初始化）
         if (motor_gpio_initialized_member_) {
@@ -1886,17 +1886,18 @@ void Application::SetRealtimeMotorCommand(int direction, int speed) {
 void Application::StopRealtimeMotorControl() {
     ESP_LOGI(TAG, "StopRealtimeMotorControl");
     realtime_control_active_.store(false);
-    current_motor_priority_.store(0); // Reset priority
+    current_motor_priority_.store(0);
+    current_pwm_duty_.store(0);
     if (motor_pwm_initialized_member_) {
-        // 平滑降到 0
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_FADE_NO_WAIT);
-        ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0, pwm_ramp_ms_);
-        ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, LEDC_FADE_NO_WAIT);
+        // 直接设置占空比为 0
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
     } else if (motor_gpio_initialized_member_) {
         gpio_set_level(MOTOR_LF_GPIO, 0);
         gpio_set_level(MOTOR_LB_GPIO, 0);
@@ -1906,6 +1907,16 @@ void Application::StopRealtimeMotorControl() {
     // Removed queue cleanup - now using unified PWM system
     // 重置时间戳
     last_realtime_command_ms_.store(0);
+}
+
+void Application::ClearWebControlState() {
+    // WebSocket 断开时：清理 web 控制状态，立即允许进入省电模式
+    web_control_active_.store(false);
+    last_web_control_time_ms_.store(0);
+    last_web_direction_ = 0;
+    last_web_speed_ = 0;
+    UpdatePowerSaveLevel();
+    ESP_LOGI(TAG, "WebSocket disconnected, web control state cleared");
 }
 
 void Application::InitMotorPwm() {
@@ -1969,7 +1980,7 @@ void Application::InitMotorPwm() {
     }
 
     motor_pwm_initialized_member_ = true;
-    ESP_LOGI(TAG, "InitMotorPwm: initialized (freq=%dHz, bits=%d, ramp=%dms)", pwm_freq_hz_, pwm_resolution_bits_, pwm_ramp_ms_);
+    ESP_LOGI(TAG, "InitMotorPwm: initialized (freq=%dHz, bits=%d)", pwm_freq_hz_, pwm_resolution_bits_);
 }
 
 // TriggerMotorEmotion 说明（中文）：

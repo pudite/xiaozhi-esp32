@@ -78,6 +78,17 @@ bool WebServer::Start(int port) {
     };
     httpd_register_uri_handler(server_handle_, &api_motor_action_uri);
 
+    // 注册 WebSocket 电机控制端点
+    httpd_uri_t ws_control_uri = {
+        .uri       = "/ws/control",
+        .method    = HTTP_GET,
+        .handler   = ws_control_handler,
+        .user_ctx  = this,
+        .is_websocket = true,
+        .handle_ws_control_frames = false
+    };
+    httpd_register_uri_handler(server_handle_, &ws_control_uri);
+
     // 注意：/stream 处理器已移至独立的流媒体服务器（端口 81）
 
     httpd_uri_t debug_uri = {
@@ -227,6 +238,16 @@ void WebServer::SetMotorControlCallback(std::function<void(int direction, int sp
 void WebServer::InvokeMotorControl(int direction, int speed) {
     if (motor_control_callback_) {
         motor_control_callback_(direction, speed);
+    }
+}
+
+void WebServer::SetWebControlStateClearCallback(std::function<void()> callback) {
+    web_control_state_clear_callback_ = callback;
+}
+
+void WebServer::InvokeWebControlStateClear() {
+    if (web_control_state_clear_callback_) {
+        web_control_state_clear_callback_();
     }
 }
 
@@ -527,6 +548,109 @@ esp_err_t WebServer::api_control_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+
+    return ESP_OK;
+}
+
+// WebSocket 电机控制 handler — 持久长连接，避免 HTTP 频繁建连/断连
+// 注意：httpd_parse.c 中的 httpd_ws_get_frame_type() 已读取了 WebSocket 帧的第一个字节
+// （FIN + Opcode），因此我们不能用 httpd_ws_recv_frame()（会重复读取导致错位），
+// 也不能用 httpd_req_recv()（GET 请求的 remaining_len 为 0），
+// 而是直接用 lwip 的 recv() 从原始 socket 读取剩余帧数据。
+esp_err_t WebServer::ws_control_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+
+    if (req->method == HTTP_GET) {
+        // 初始 WebSocket 握手请求，httpd 框架已自动完成握手
+        return ESP_OK;
+    }
+
+    // 帧类型已由 httpd_parse.c 中的 httpd_ws_get_frame_type() 解析
+    int fd = httpd_req_to_sockfd(req);
+
+    // 读取第二字节（长度 + mask 标志）
+    uint8_t second_byte;
+    int rd = recv(fd, &second_byte, 1, 0);
+    if (rd < 1) {
+        // 连接断开，停止电机并清理电源状态
+        server->InvokeMotorControl(0, 0);
+        server->InvokeWebControlStateClear();
+        return ESP_FAIL;
+    }
+
+    bool masked = (second_byte & 0x80) != 0;
+    uint8_t init_len = second_byte & 0x7F;
+
+    uint64_t payload_len = init_len;
+    if (init_len == 126) {
+        uint8_t ext_len[2];
+        rd = recv(fd, ext_len, 2, 0);
+        if (rd < 2) return ESP_FAIL;
+        payload_len = ((uint64_t)ext_len[0] << 8) | ext_len[1];
+    } else if (init_len == 127) {
+        uint8_t ext_len[8];
+        rd = recv(fd, ext_len, 8, 0);
+        if (rd < 8) return ESP_FAIL;
+        for (int i = 0; i < 8; i++) {
+            payload_len = (payload_len << 8) | ext_len[i];
+        }
+    }
+
+    uint8_t mask_key[4] = {0};
+    if (masked) {
+        rd = recv(fd, mask_key, 4, 0);
+        if (rd < 4) return ESP_FAIL;
+    }
+
+    if (payload_len > 128) {
+        // 指令太长，跳过并消耗数据
+        char dummy[64];
+        while (payload_len > 0) {
+            int to_read = payload_len > 64 ? 64 : (int)payload_len;
+            rd = recv(fd, dummy, to_read, 0);
+            if (rd < 1) break;
+            payload_len -= rd;
+        }
+        return ESP_OK;
+    }
+
+    // 读取 payload 并解 mask
+    uint8_t buf[129] = {0};
+    size_t total = 0;
+    while (total < payload_len) {
+        rd = recv(fd, buf + total, payload_len - total, 0);
+        if (rd <= 0) break;
+        total += rd;
+    }
+
+    // 如果读取失败，连接断开，停止电机并清理状态
+    if (total == 0 && payload_len > 0) {
+        server->InvokeMotorControl(0, 0);
+        server->InvokeWebControlStateClear();
+        return ESP_FAIL;
+    }
+
+    // 解 mask（浏览器到服务器的帧必须带 mask）
+    if (masked) {
+        for (size_t i = 0; i < total; i++) {
+            buf[i] ^= mask_key[i % 4];
+        }
+    }
+
+    // 解析 JSON 指令
+    if (total > 0) {
+        buf[total] = '\0';
+        cJSON* root = cJSON_Parse((char*)buf);
+        if (root) {
+            int direction = 0, speed = 0;
+            cJSON* jdir = cJSON_GetObjectItem(root, "direction");
+            cJSON* jspd = cJSON_GetObjectItem(root, "speed");
+            if (cJSON_IsNumber(jdir)) direction = jdir->valueint;
+            if (cJSON_IsNumber(jspd)) speed = jspd->valueint;
+            cJSON_Delete(root);
+            server->InvokeMotorControl(direction, speed);
+        }
+    }
 
     return ESP_OK;
 }
@@ -1077,7 +1201,7 @@ const char* WebServer::get_html_page() {
             border-radius: 50%; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-            transition: all 0.1s ease; cursor: pointer;
+            cursor: pointer;
         }
         .joystick.active {
             background: linear-gradient(135deg, #2196F3, #1976D2);
@@ -1220,7 +1344,6 @@ const char* WebServer::get_html_page() {
         let isDragging = false;
         let currentDirection = 0;
         let currentSpeed = 0;
-        let isRequestPending = false;
 
         // 视频流变量
         let streamState = 'idle'; // idle | opening | open | closing
@@ -1259,20 +1382,30 @@ const char* WebServer::get_html_page() {
             const maxR = rect.width / 2 - 30;
             const dist = Math.sqrt(rx * rx + ry * ry);
             if (dist > maxR) { rx = (rx / dist) * maxR; ry = (ry / dist) * maxR; }
+            // 拖拽时禁用 transition，确保即时响应
+            joystick.style.transition = 'none';
             joystick.style.left = `calc(50% + ${rx}px)`;
             joystick.style.top = `calc(50% + ${ry}px)`;
             const nx = rx / maxR, ny = ry / maxR;
             let angle = Math.atan2(ny, nx) * (180 / Math.PI);
             if (angle < 0) angle += 360;
-            const speed = Math.min(dist / maxR, 1) * 100;
+            const rawSpeed = Math.min(dist / maxR, 1);
             let dir = 0;
-            if (speed > 5) {
+            let speed = 0;
+            if (rawSpeed > 0.05) {
                 if (angle >= 315 || angle < 45) dir = 1;
                 else if (angle >= 45 && angle < 135) dir = 2;
                 else if (angle >= 135 && angle < 225) dir = 3;
                 else dir = 4;
+                // 5 档离散速度在 90-100 安全范围内均分（避开 70-80% 堵转噪音区）
+                // TODO: 电机换 5V 供电后降低档位：30/50/70/85/100
+                if (rawSpeed < 0.2) speed = 90;
+                else if (rawSpeed < 0.4) speed = 92;
+                else if (rawSpeed < 0.6) speed = 95;
+                else if (rawSpeed < 0.8) speed = 97;
+                else speed = 100;
             }
-            return { direction: dir, speed: Math.round(speed) };
+            return { direction: dir, speed: speed };
         }
 
         function updateDirectionIndicator(dir, speed) {
@@ -1289,43 +1422,47 @@ const char* WebServer::get_html_page() {
             directionIndicator.classList.toggle('active', speed > 5);
         }
 
-        async function sendControl(dir, speed) {
-            if (dir === 0 && speed === 0) {
-                currentDirection = 0; currentSpeed = 0;
-                try {
-                    const r = await fetch('/api/control', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ direction: 0, speed: 0 })
-                    });
-                    if (!r.ok) throw new Error();
-                } catch (e) {
-                    showToast('发送失败', true);
-                }
-                return;
-            }
-            // 后端有 dedup，前端不拦截（否则按住不动时后端收不到心跳）
-            if (isRequestPending) return;
-            currentDirection = dir; currentSpeed = speed;
-            isRequestPending = true;
-            try {
-                const r = await fetch('/api/control', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ direction: dir, speed: speed })
-                });
-                if (!r.ok) throw new Error();
+        // WebSocket 电机控制 — 持久长连接，避免 HTTP 频繁建连/断连
+        let ws = null;
+        let wsReconnectTimer = null;
+
+        function connectWs() {
+            if (ws && ws.readyState === WebSocket.OPEN) return;
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${location.host}/ws/control`);
+            ws.onopen = () => {
                 remoteBadge.textContent = '遥控已连接';
                 remoteBadge.style.background = '#d4edda';
                 remoteBadge.style.color = '#155724';
-            } catch (e) {
+                if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+            };
+            ws.onclose = () => {
                 remoteBadge.textContent = '连接断开';
                 remoteBadge.style.background = '#f8d7da';
                 remoteBadge.style.color = '#721c24';
-                showToast('发送失败', true);
-            } finally {
-                isRequestPending = false;
+                if (!wsReconnectTimer) wsReconnectTimer = setTimeout(connectWs, 1000);
+            };
+            ws.onerror = () => {};
+        }
+
+        // 自动建立 WebSocket 连接
+        connectWs();
+
+        let lastSendTime = 0;
+        const SEND_INTERVAL = 100; // 100ms 节流，降低发送频率
+
+        function sendControl(dir, speed) {
+            currentDirection = dir; currentSpeed = speed;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ direction: dir, speed: speed }));
             }
+        }
+
+        function throttledSend(dir, speed) {
+            const now = performance.now();
+            if (now - lastSendTime < SEND_INTERVAL) return;
+            lastSendTime = now;
+            sendControl(dir, speed);
         }
 
         function stopCar() {
@@ -1366,13 +1503,13 @@ const char* WebServer::get_html_page() {
             isDragging = true; joystick.classList.add('active');
             const { direction, speed } = updateJoystickPosition(e.clientX, e.clientY);
             updateDirectionIndicator(direction, speed);
-            sendControl(direction, speed);
+            throttledSend(direction, speed);
         });
         document.addEventListener('mousemove', (e) => {
             if (isDragging) {
                 const { direction, speed } = updateJoystickPosition(e.clientX, e.clientY);
                 updateDirectionIndicator(direction, speed);
-                sendControl(direction, speed);
+                throttledSend(direction, speed);
             }
         });
         document.addEventListener('mouseup', () => { if (isDragging) stopCar(); });
@@ -1381,7 +1518,7 @@ const char* WebServer::get_html_page() {
             const t = e.touches[0];
             const { direction, speed } = updateJoystickPosition(t.clientX, t.clientY);
             updateDirectionIndicator(direction, speed);
-            sendControl(direction, speed);
+            throttledSend(direction, speed);
         });
         joystickContainer.addEventListener('touchmove', (e) => {
             e.preventDefault();
@@ -1389,7 +1526,7 @@ const char* WebServer::get_html_page() {
                 const t = e.touches[0];
                 const { direction, speed } = updateJoystickPosition(t.clientX, t.clientY);
                 updateDirectionIndicator(direction, speed);
-                sendControl(direction, speed);
+                throttledSend(direction, speed);
             }
         });
         joystickContainer.addEventListener('touchend', (e) => {

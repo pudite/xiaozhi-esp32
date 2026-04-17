@@ -202,26 +202,30 @@ private:
     // API for realtime control (bypass queue)
     void SetRealtimeMotorCommand(int direction, int speed);
     void StopRealtimeMotorControl();
+    void ClearWebControlState();  // Called when WebSocket disconnects
     // Timestamp (ms) of last realtime command, used for watchdog to auto-stop
     std::atomic<int64_t> last_realtime_command_ms_{0};
 
     // WEB control state tracking for intelligent power management
     std::atomic<bool> web_control_active_{false};
     std::atomic<int64_t> last_web_control_time_ms_{0};
+    int last_web_direction_ = 0;  // 去重：避免重复处理相同指令
+    int last_web_speed_ = 0;
     // Video stream state tracking (stream active also needs PERFORMANCE mode)
     std::atomic<bool> stream_active_{false};
     PowerSaveLevel current_power_level_{PowerSaveLevel::LOW_POWER};
     static constexpr int WEB_CONTROL_TIMEOUT_MS = 30000;     // 电源管理超时
-    static constexpr int WEB_CONTROL_WATCHDOG_MS = 500;      // 电机安全看门狗超时
+    static constexpr int WEB_CONTROL_WATCHDOG_MS = 1500;     // 电机安全看门狗超时
     std::mutex power_mutex_;  // 保护电源状态更新
 
     // PWM (LEDC) support
     bool motor_pwm_initialized_member_ = false;
-    int pwm_freq_hz_ = 20000;
+    int pwm_freq_hz_ = 5000;   // 5kHz 适合 L298N（>10kHz 时切换跟不上）
     int pwm_resolution_bits_ = 10;
     void InitMotorPwm();
-    // Ramp (ms) for PWM fade
-    int pwm_ramp_ms_ = 50;
+
+    // Kick-start support: track if motor is currently running
+    std::atomic<int> current_pwm_duty_{0};  // 当前实际输出占空比，用于判断是否需要 kick-start
 
     // Intelligent power management
     void UpdatePowerSaveLevel();

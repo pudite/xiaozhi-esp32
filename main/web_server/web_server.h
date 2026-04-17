@@ -22,6 +22,11 @@ public:
     // 由外部调用以触发电机控制（封装私有回调）
     void InvokeMotorControl(int direction, int speed);
 
+    // 注册 WebSocket 断开清理回调
+    void SetWebControlStateClearCallback(std::function<void()> callback);
+    // 由 WebSocket handler 调用以清理 web 控制状态
+    void InvokeWebControlStateClear();
+
     // 注册表情设置回调函数
     void SetEmotionCallback(std::function<void(const char* emotion)> callback);
     // 设置表情（封装私有回调）
@@ -74,6 +79,7 @@ private:
     httpd_handle_t stream_server_handle_;
     int stream_port_;
     std::function<void(int direction, int speed)> motor_control_callback_;
+    std::function<void()> web_control_state_clear_callback_;
     std::function<void(const char* emotion)> emotion_callback_;
     std::function<Esp32Camera*()> camera_callback_;
     std::function<std::pair<bool, bool>()> get_camera_flip_callback_;
@@ -101,6 +107,9 @@ private:
     static esp_err_t api_camera_flip_post_handler(httpd_req_t *req);
     static esp_err_t api_camera_photo_get_handler(httpd_req_t *req);
     static esp_err_t api_camera_quality_post_handler(httpd_req_t *req);
+
+    // WebSocket 电机控制
+    static esp_err_t ws_control_handler(httpd_req_t *req);
 
     // CORS处理
     static esp_err_t cors_handler(httpd_req_t *req);

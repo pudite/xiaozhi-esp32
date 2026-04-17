@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:\\\\Espressif/tools/ninja/1.12.1/ninja.exe\")"
+    ]
+  }
+}
