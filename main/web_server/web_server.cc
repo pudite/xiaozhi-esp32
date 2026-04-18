@@ -1397,13 +1397,8 @@ const char* WebServer::get_html_page() {
                 else if (angle >= 45 && angle < 135) dir = 2;
                 else if (angle >= 135 && angle < 225) dir = 3;
                 else dir = 4;
-                // 5 档离散速度在 90-100 安全范围内均分（避开 70-80% 堵转噪音区）
-                // TODO: 电机换 5V 供电后降低档位：30/50/70/85/100
-                if (rawSpeed < 0.2) speed = 90;
-                else if (rawSpeed < 0.4) speed = 92;
-                else if (rawSpeed < 0.6) speed = 95;
-                else if (rawSpeed < 0.8) speed = 97;
-                else speed = 100;
+                // 连续速度：5V 供电，最低 50 保证启动（3.3V 供电时 Math.max 改为 90）
+                speed = Math.max(50, Math.round(rawSpeed * 100));
             }
             return { direction: dir, speed: speed };
         }

@@ -1750,9 +1750,8 @@ void Application::HandleWebMotorControl(int direction, int speed) {
         return;
     }
 
-    // L298N + N20蜗杆减速电机启动阈值较高
-    // speed < 50 时提升到 50，确保电机能启动
-    if (speed < 50) {
+    // 5V 供电下最低 50 保证启动（3.3V 供电时建议改为 90）
+    if (speed > 0 && speed < 50) {
         speed = 50;
     }
 
@@ -1807,11 +1806,11 @@ void Application::SetRealtimeMotorCommand(int direction, int speed) {
     if (motor_pwm_initialized_member_) {
         uint32_t max_duty = (1 << pwm_resolution_bits_) - 1;
 
-        // Kick-start: boost first command from stop to break static friction
+        // Kick-start: 5V 供电下 70% 足够突破静摩擦（3.3V 供电时建议改回 85）
         int effective_speed = speed;
         int prev_duty = current_pwm_duty_.load();
         if (prev_duty == 0 && speed > 0) {
-            effective_speed = speed > 85 ? speed : 85;
+            effective_speed = speed > 70 ? speed : 70;
         }
         uint32_t duty = (effective_speed * max_duty) / 100;
         current_pwm_duty_.store(effective_speed);
