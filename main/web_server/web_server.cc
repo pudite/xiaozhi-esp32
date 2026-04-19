@@ -883,6 +883,13 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
     fd = httpd_req_to_sockfd(req);
     ESP_LOGI(TAG, "Stream client connected, fd=%d", fd);
 
+    // 流媒体开始时强制启动摄像头流
+    Esp32Camera* camera = nullptr;
+    camera = server->camera_callback_();
+    if (camera) {
+        camera->StartStream();
+    }
+
     // 流媒体开始时强制 WiFi 高性能模式，降低网络延迟
     if (server->power_save_callback_) {
         ESP_LOGI(TAG, "Stream: forcing WiFi PERFORMANCE mode");
@@ -923,7 +930,7 @@ esp_err_t WebServer::stream_get_handler(httpd_req_t *req) {
     ESP_LOGD(TAG, "Stream: entering capture loop, fd=%d", fd);
 
     while (true) {
-        Esp32Camera* camera = server->camera_callback_();
+        camera = server->camera_callback_();
         if (!camera) {
             ESP_LOGW(TAG, "Stream: camera callback returned null (fail count: %d)", consecutive_failures + 1);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1014,6 +1021,10 @@ next_frame:;
     }
 
 stream_end:
+    // 停止摄像头流
+    if (camera) {
+        camera->StopStream();
+    }
     if (tx_buf) {
         heap_caps_free(tx_buf);
     }

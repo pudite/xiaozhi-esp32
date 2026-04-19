@@ -49,6 +49,12 @@ private:
     // 保护 frame_ 和 stream_buf_ 的多线程访问（httpd 并发请求、Explain 与 CaptureStreamFrame 并发）
     mutable std::mutex frame_mutex_;
 
+    // 按需启停：空闲超时自动关闭流（省电）
+    TickType_t last_active_tick_;
+    static constexpr int AUTO_STOP_TIMEOUT_MS = 60000;  // 60 秒无活动自动关闭
+
+    bool EnsureStreamStarted();
+
 public:
     Esp32Camera(const esp_video_init_config_t& config);
     ~Esp32Camera();
@@ -73,6 +79,11 @@ public:
     // 轻量级流媒体帧捕获：直接从 mmap 缓冲区读取 JPEG 数据，
     // 跳过 LVGL 预览解码和 PSRAM 分配。仅适用于 JPEG 格式摄像头。
     bool CaptureStreamFrame();
+
+    // 流控制：按需启停摄像头数据流（省电优化）
+    void StartStream();
+    void StopStream();
+    bool IsStreaming() const { return streaming_on_; }
 
     // 帧数据访问的锁保护（供 web_server 并发读取时使用）
     void LockFrame() const { frame_mutex_.lock(); }

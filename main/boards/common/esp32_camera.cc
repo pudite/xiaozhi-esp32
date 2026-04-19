@@ -317,6 +317,7 @@ Esp32Camera::Esp32Camera(const esp_video_init_config_t& config) {
         }
     }
 
+#ifdef CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(video_fd_, VIDIOC_STREAMON, &type) != 0) {
         ESP_LOGE(TAG, "VIDIOC_STREAMON failed");
@@ -326,7 +327,6 @@ Esp32Camera::Esp32Camera(const esp_video_init_config_t& config) {
         return;
     }
 
-#ifdef CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
     // 当启用 ISP 时，ISP 需要一些照片来初始化参数，因此开启后后台拍摄5s照片并丢弃
     xTaskCreate(
         [](void* arg) {
@@ -361,8 +361,10 @@ Esp32Camera::Esp32Camera(const esp_video_init_config_t& config) {
     // 设为 52 (QS=11) 以平衡画质和传输延迟，640x480 下约 30KB
     SetJpegQuality(52);
 
-    ESP_LOGI(TAG, "Camera init success");
-    streaming_on_ = true;
+    // 按需启用：开机不启动视频流，等待 Web/MCP 调用时自动唤醒
+    streaming_on_ = false;
+    last_active_tick_ = 0;
+    ESP_LOGI(TAG, "Camera init success (stream off, will auto-start on demand)");
 #endif  // CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
 }
 
@@ -393,6 +395,46 @@ Esp32Camera::~Esp32Camera() {
     esp_video_deinit();
 }
 
+void Esp32Camera::StartStream() {
+    if (streaming_on_ || video_fd_ < 0) return;
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(video_fd_, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "StartStream: VIDIOC_STREAMON failed, errno=%d", errno);
+        return;
+    }
+    streaming_on_ = true;
+    last_active_tick_ = xTaskGetTickCount();
+    ESP_LOGI(TAG, "Camera stream started");
+}
+
+void Esp32Camera::StopStream() {
+    if (!streaming_on_ || video_fd_ < 0) return;
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(video_fd_, VIDIOC_STREAMOFF, &type) != 0) {
+        ESP_LOGE(TAG, "StopStream: VIDIOC_STREAMOFF failed, errno=%d", errno);
+        return;
+    }
+    // STREAMOFF 后所有缓冲区回到未入队状态，需要重新 QBUF
+    // 否则下次 STREAMON 后没有可用缓冲区，DQBUF 会失败
+    for (size_t i = 0; i < mmap_buffers_.size(); i++) {
+        struct v4l2_buffer buf = {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "StopStream: VIDIOC_QBUF failed for buffer %zu", i);
+        }
+    }
+    streaming_on_ = false;
+    ESP_LOGI(TAG, "Camera stream stopped (power save)");
+}
+
+bool Esp32Camera::EnsureStreamStarted() {
+    if (streaming_on_) return true;
+    StartStream();
+    return streaming_on_;
+}
+
 void Esp32Camera::SetExplainUrl(const std::string& url, const std::string& token) {
     explain_url_ = url;
     explain_token_ = token;
@@ -403,7 +445,7 @@ bool Esp32Camera::Capture() {
         encoder_thread_.join();
     }
 
-    if (!streaming_on_ || video_fd_ < 0) {
+    if (!EnsureStreamStarted()) {
         return false;
     }
 
@@ -954,8 +996,8 @@ bool Esp32Camera::Capture() {
  * 中的 JPEG 软解码（~500ms CPU）导致的帧率过低和 SRAM 不足问题。
  */
 bool Esp32Camera::CaptureStreamFrame() {
-    if (!streaming_on_ || video_fd_ < 0) {
-        ESP_LOGW(TAG, "CSF: not streaming or fd invalid, streaming_on=%d, fd=%d", streaming_on_, video_fd_);
+    if (!EnsureStreamStarted()) {
+        ESP_LOGW(TAG, "CSF: stream not started, streaming_on=%d, fd=%d", streaming_on_, video_fd_);
         return false;
     }
 
@@ -1088,6 +1130,15 @@ bool Esp32Camera::CaptureStreamFrame() {
     }
 
     ESP_LOGD(TAG, "CSF: OK jpeg_size=%u", (unsigned)jpeg_size);
+
+    // 检查空闲超时（距离上次成功捕获 > 60 秒则自动关闭）
+    TickType_t now = xTaskGetTickCount();
+    if (last_active_tick_ > 0 && (now - last_active_tick_) * portTICK_PERIOD_MS > AUTO_STOP_TIMEOUT_MS) {
+        StopStream();
+        return false;
+    }
+    last_active_tick_ = now;
+
     return true;
 }
 
